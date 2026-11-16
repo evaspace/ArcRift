@@ -4,6 +4,7 @@ param(
     [Parameter(Mandatory=$true)][string]$Nonce,
     [switch]$ProbeOnly,
     [switch]$WaitForCompositor,
+    [switch]$TolerateSyncTimeouts,  # 1.4: manual sessions; a few SteamVR sync timeouts while starting do not fail the launch
     [int]$MetaServerPid = 0,
     [int]$SourceHelperPid = 0
 )
@@ -41,6 +42,7 @@ try {
     $steamPath = Get-ArcRiftSteamPath
     $bin = Join-Path (Get-ArcRiftSteamVRPath $steamPath) 'bin\win64'
     $bootState = @{}
+    $bootSyncTimeouts = 0
     if ($WaitForCompositor) {
         . (Join-Path $PSScriptRoot 'steamvr-startup-policy.ps1')
         $graphicsLog = Join-Path $steamPath 'logs\vrcompositor.txt'
@@ -78,8 +80,8 @@ try {
             $backendTail += Read-ArcRiftStartupLog $backendLog ([ref]$backendOffset)
             if ($graphicsTail.Length -gt 8192) { $graphicsTail = $graphicsTail.Substring($graphicsTail.Length-8192) }
             if ($backendTail.Length -gt 8192) { $backendTail = $backendTail.Substring($backendTail.Length-8192) }
-            if ($graphicsTail -match '(?i:AcquireSync FAILED|ReleaseSync FAILED|WaitForAcquire timed out|DXGI_ERROR_DEVICE_REMOVED|DXGI_ERROR_DEVICE_HUNG)' -or
-                $backendTail -match '(?i:Renderer failed|Surface failed|Present frame=\d+ result=(?!00000000)[a-f0-9]{8})') { throw 'Graphics/synchronization failure during normal-user bootstrap.' }
+            $bootSyncTimeouts = Get-ArcRiftBootstrapSyncCount $graphicsTail ([bool]$TolerateSyncTimeouts)
+            if ($backendTail -match '(?i:Renderer failed|Surface failed|Present frame=\d+ result=(?!00000000)[a-f0-9]{8})') { throw 'Graphics/synchronization failure during normal-user bootstrap.' }
             if (Test-ArcRiftSteamVRStartup $bootState $ids $cids ($graphicsTail -match 'Startup Complete')) { break }
             if ((Get-Date) -gt $deadline) { throw 'Normal-user compositor startup exceeded 8 seconds; diagnostic not launched.' }
             Start-Sleep -Milliseconds 100
@@ -91,6 +93,7 @@ try {
         Nonce=$Nonce; StartupPid=$startup.Id; ClientPid=$client.Id
         ClientIntegrity=[ArcRiftIntegrityProbe]::Integrity($client.Id)
         BootstrapServerId=$bootState.ServerId; BootstrapCompositorId=$bootState.CompositorId
+        BootstrapSyncTimeouts=$bootSyncTimeouts
     })
 } catch {
     Publish-WorkerJson 'user-worker-error.json' ([ordered]@{Nonce=$Nonce; Error=$_.Exception.Message})

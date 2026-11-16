@@ -96,6 +96,17 @@ try {
     }
     # v3: start Meta's runtime first; the Rift S display only appears while it runs. Then retry the restart.
     Start-Service OVRService
+    # Release 1.4 (Rift CV1, experimental): a CV1 session switches the headset display's Windows mode instead of
+    # applying an EDID, and leaves headset-mode-switched.txt in its folder. Ask Windows to go back to its saved mode;
+    # the monitor restart and the layout check below then work the same as for a Rift S. Never fails the recovery.
+    if (Test-Path -LiteralPath (Join-Path $full 'headset-mode-switched.txt')) {
+        try {
+            . (Join-Path $root 'display-mode.ps1')
+            $modeSource=[ArcRiftDisplayMode]::Source((($edid.Instance -replace '\\','#')+'#').ToLowerInvariant())
+            if ($modeSource) { Write-Output ('Headset display mode restore result: ' + [ArcRiftDisplayMode]::Restore($modeSource)); Start-Sleep -Seconds 2 }
+            else { Write-Output 'Headset display is not active; Windows uses its saved mode when it comes back.' }
+        } catch { Write-Output ('Headset display mode restore note: ' + $_.Exception.Message) }
+    }
     $monitorRestarted = $false
     for ($i = 0; $i -lt 20 -and -not $monitorRestarted; $i++) {
         & pnputil.exe /restart-device $edid.Instance

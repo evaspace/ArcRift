@@ -4,9 +4,22 @@ arcrift-identity.txt
 d3d11-*/
 active-test.xml
 active-test.lock
+active-test-dismissed.xml
 boundary-*.txt
 boundary-*.json
+compat-report-*.txt
+cv1-mode-test-*.txt
+cv1-probe-active.txt
+cv1-override.edid
+manual-recovery-*.txt
+recovery-dismissed.txt
+live-tests-paused.txt
+steamvr-tests-paused.txt
 *.log
+
+# Intel's Graphics Control Library header, needed only to build the experimental arcrift_igcl_edid.exe.
+# NOTICE.md says no Intel library files are included: decide on its licence before publishing it.
+source/igcl_api.h
 
 # Build intermediates
 source/build/

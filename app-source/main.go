@@ -31,7 +31,7 @@ import (
 //go:embed web
 var webFiles embed.FS
 
-const appVersion = "1.3"
+const appVersion = "1.5"
 
 var (
 	root      string
@@ -653,8 +653,22 @@ func status() map[string]any {
 
 var releasePrograms = []string{"arc_rift_bridge.dll", "native_source_test.exe", "native_source_session.exe", "display_probe.exe", "bridge_selftest.exe", "arcrift_boundary.exe"}
 
-// GPUs a full VRChat session has been confirmed on. Other Intel GPUs are allowed but marked untested.
-var testedGPUs = map[string]string{"VEN_8086&DEV_56A0": "Intel Arc A770"}
+// 1.4: the Intel Arc desktop cards ArcRift knows, by PCI device ID. Tested means a full VRChat session was confirmed
+// on it. Every other card, and any Intel GPU not listed here, is allowed but marked untested; Note says what is known.
+type arcCard struct {
+	Name   string
+	Tested bool
+	Note   string
+}
+
+var arcCards = map[string]arcCard{
+	"VEN_8086&DEV_56A0": {"Intel Arc A770", true, ""},
+	"VEN_8086&DEV_56A1": {"Intel Arc A750", false, "it is the same family as the tested A770"},
+	"VEN_8086&DEV_56A2": {"Intel Arc A580", false, "it is the same family as the tested A770"},
+	"VEN_8086&DEV_56A5": {"Intel Arc A380", false, "it is the same family as the tested A770 but much slower, so expect to lower the SteamVR resolution"},
+	"VEN_8086&DEV_E20B": {"Intel Arc B580", false, "one report says the headset display mode did not switch on this card (Windows 10); a session then stops and restores"},
+	"VEN_8086&DEV_E20C": {"Intel Arc B570", false, "it is the same family as the B580, where the headset display mode was reported not to switch"},
+}
 
 func compatible(c identity) map[string]any {
 	issues, warnings := []string{}, []string{}
@@ -670,10 +684,14 @@ func compatible(c identity) map[string]any {
 		issues = append(issues, "no GPU recorded; run Setup again")
 	case !strings.HasPrefix(gpu, "VEN_8086&"):
 		issues = append(issues, "the GPU is not an Intel GPU ("+c.GPUName+"); this project only supports Intel Arc")
-	case testedGPUs[gpu] == "":
-		warnings = append(warnings, c.GPUName+" has not been tested yet. It may work; all safety guards and automatic restore stay active")
+	case !arcCards[gpu].Tested:
+		known := ""
+		if card, ok := arcCards[gpu]; ok {
+			known = " (" + card.Note + ")"
+		}
+		warnings = append(warnings, c.GPUName+" has not been tested yet"+known+". It may work; all safety guards and automatic restore stay active. To help, press Check my PC on the Setup tab and send the report")
 	}
-	return map[string]any{"ok": len(issues) == 0, "issues": issues, "warnings": warnings, "tested": testedGPUs[gpu] != ""}
+	return map[string]any{"ok": len(issues) == 0, "issues": issues, "warnings": warnings, "tested": arcCards[gpu].Tested}
 }
 
 func fileExists(p string) bool {
@@ -752,6 +770,25 @@ func startSession(guardian bool) (string, error) {
 		return "Restoring the last session first, then starting. Approve the Windows administrator prompt; a PowerShell window opens and must stay open. Keep the headset plugged in.", nil
 	}
 	return "Starting. Approve the Windows administrator prompt; a PowerShell window opens and must stay open.", nil
+}
+
+// compatReport (1.4) runs the read-only compatibility report (compat-report.ps1) and shows the file it wrote.
+var reReportPath = regexp.MustCompile(`(?m)^Report written: (.+?)\s*$`)
+
+func compatReport() (string, error) {
+	if st := status(); st["state"] != "idle" {
+		return "", fmt.Errorf("stop the VR session first; the report is for when no session is running")
+	}
+	if !fileExists(filepath.Join(root, "compat-report.ps1")) {
+		return "", fmt.Errorf("compat-report.ps1 is missing from the ArcRift folder")
+	}
+	out := runCapture(psFile("compat-report.ps1"), 2*time.Minute)
+	m := reReportPath.FindStringSubmatch(out)
+	if m == nil {
+		return "", fmt.Errorf("the report was not written: %s", out)
+	}
+	exec.Command("explorer.exe", "/select,"+m[1]).Start()
+	return out, nil
 }
 
 func runCapture(cmd *exec.Cmd, timeout time.Duration) string {
@@ -1098,6 +1135,13 @@ func main() {
 		}
 		exec.Command("explorer.exe", target).Start()
 		return map[string]any{"ok": true}, nil
+	}))
+	mux.HandleFunc("/api/compat-report", api(func(r *http.Request) (any, error) {
+		msg, err := compatReport()
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"ok": true, "message": msg}, nil
 	}))
 	mux.HandleFunc("/api/debug-tool", api(func(r *http.Request) (any, error) {
 		return map[string]any{"ok": true, "message": openDebugTool()}, nil

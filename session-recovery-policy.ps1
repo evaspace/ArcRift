@@ -18,15 +18,19 @@ function Assert-ArcRiftRecoveryScope($Registry,$Plugins,$Edid) {
         'HKLM:\SOFTWARE\Oculus|ForceGPUDriverVersionAcceptance',
         'HKLM:\SOFTWARE\WOW6432Node\Oculus VR, LLC\Oculus\Config|PreventDashLaunch'
     )
+    # Release 1.4: sessions also set ForceSensorTracking (Meta keeps tracking on while the headset is off). Sessions
+    # from before that have the three settings above only, so a backup holds those three, with or without this one.
+    $optional = @('HKLM:\SOFTWARE\WOW6432Node\Oculus VR, LLC\Oculus|ForceSensorTracking')
     # Release 1.1.2: a session skips streaming plugins Meta no longer installs, so 0-3 plugin backups are valid.
-    if (@($Registry).Count -ne 3 -or @($Plugins).Count -gt 3) { throw 'Recovery backup count mismatch.' }
+    if (@($Registry).Count -lt 3 -or @($Registry).Count -gt 4 -or @($Plugins).Count -gt 3) { throw 'Recovery backup count mismatch.' }
     $pluginFolder = Join-Path (Get-ArcRiftMetaRuntimePath) 'server-plugins'
     $seen = @{}
     foreach ($r in $Registry) {
         $key=$r.Path+'|'+$r.Name
-        if ($key -notin $allowed -or $seen.ContainsKey($key)) { throw 'Recovery registry scope mismatch.' }
+        if (($key -notin $allowed -and $key -notin $optional) -or $seen.ContainsKey($key)) { throw 'Recovery registry scope mismatch.' }
         $seen[$key]=$true
     }
+    foreach ($key in $allowed) { if (-not $seen.ContainsKey($key)) { throw 'Recovery registry scope mismatch.' } }
     $seen=@{}
     foreach ($p in $Plugins) {
         $name=[IO.Path]::GetFileName($p.Original)

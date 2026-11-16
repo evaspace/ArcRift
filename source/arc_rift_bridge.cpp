@@ -11,10 +11,13 @@
 #include "ovr_direct_display.h"
 #include "texture_summary.h"
 #include "arcrift_identity.h"
+#include "edid_mode.h"
 using Microsoft::WRL::ComPtr;
 static HMODULE self;
 // Release 1.1: headset/GPU identity comes from arcrift-identity.txt next to this DLL.
 static const ArcRiftIdentity& Identity() { static const ArcRiftIdentity id = ArcRiftLoadIdentity(self); return id; }
+// Release 1.4: the headset's mode (size, refresh rate) comes from the session's EDID file, not fixed Rift S numbers.
+static const ArcRiftEdidMode& Mode() { static const ArcRiftEdidMode mode = ArcRiftLoadSessionMode(self); return mode; }
 
 static void Trace(const char* format, ...) {
     wchar_t path[MAX_PATH]{};
@@ -37,6 +40,7 @@ struct PhysicalOutput {
     LUID luid{};
     wchar_t sourceName[32]{};
     RECT rect{};
+    DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY technology = DISPLAYCONFIG_OUTPUT_TECHNOLOGY_OTHER; // how Windows says it is connected
 };
 
 // Release 1.2: when the headset display cannot be matched, say why (in "why", if given), so a failed session's
@@ -76,6 +80,7 @@ static bool GetPhysicalOutput(PhysicalOutput& out, char* why = nullptr, size_t w
         mode.dmSize = sizeof(mode);
         if (!EnumDisplaySettingsW(source.viewGdiDeviceName, ENUM_CURRENT_SETTINGS, &mode)) { snprintf(lastMismatch, sizeof(lastMismatch), "no current mode for %ls", source.viewGdiDeviceName); continue; }
         out.luid = paths[i].targetInfo.adapterId;
+        out.technology = paths[i].targetInfo.outputTechnology;
         wcscpy_s(out.sourceName, source.viewGdiDeviceName);
         out.rect = {mode.dmPosition.x, mode.dmPosition.y, mode.dmPosition.x + LONG(mode.dmPelsWidth), mode.dmPosition.y + LONG(mode.dmPelsHeight)};
         return true;
@@ -99,21 +104,7 @@ static void TraceLookupFailure(const char* where, const char* why) {
 
 
 
-static bool ReadTestEdid(char* output) {
-    wchar_t path[MAX_PATH]{};
-    GetModuleFileNameW(self, path, MAX_PATH);
-    wchar_t* last = wcsrchr(path, L'\\');
-    if (!last) return false;
-    wcscpy_s(last + 1, MAX_PATH - (last + 1 - path), L"rift-s-native-test.edid");
-    FILE* file = nullptr;
-    if (_wfopen_s(&file, path, L"rb") != 0) return false;
-    memset(output, 0, 256);
-    size_t count = fread(output, 1, 128, file);
-    fclose(file);
-    unsigned sum = 0;
-    for (size_t i = 0; i < 128; ++i) sum += static_cast<unsigned char>(output[i]);
-    return count == 128 && sum % 256 == 0 && static_cast<unsigned char>(output[8]) == 0x3e && static_cast<unsigned char>(output[9]) == 0xd2;
-}
+static bool ReadTestEdid(char* output) { return ArcRiftReadSessionEdid(self, output); }
 
 class Surface final : public OVR::IDirectDisplaySurface {
     OVR_REF_COUNTED_IMPLEMENTATION
@@ -192,7 +183,7 @@ class Display final : public OVR::IDirectDisplay {
         wc.lpszClassName = L"ArcRiftExperimentalBridge";
         wc.lpfnWndProc = Proc;
         RegisterClassW(&wc);
-        window = CreateWindowExW(WS_EX_TOPMOST | WS_EX_NOACTIVATE, wc.lpszClassName, L"Experimental Rift S display backend",
+        window = CreateWindowExW(WS_EX_TOPMOST | WS_EX_NOACTIVATE, wc.lpszClassName, L"ArcRift headset display backend",
             WS_POPUP, output.rect.left, output.rect.top, output.rect.right - output.rect.left,
             output.rect.bottom - output.rect.top, nullptr, nullptr, self, nullptr);
         if (!window) return HRESULT_FROM_WIN32(GetLastError());
@@ -249,7 +240,10 @@ public:
         char why[400] = "";
         if (!GetPhysicalOutput(output, why, sizeof(why))) { TraceLookupFailure("GetProperties", why); return ovrError_Unsupported; }
         memcpy(props->Luid.Reserved, &output.luid, sizeof(output.luid));
-        props->OutputType = ovrDisplayOutput_DP;
+        // Release 1.4: report HDMI or DVI when Windows says so (Rift CV1 uses HDMI); everything else stays DisplayPort,
+        // which is what the Rift S has always been reported as.
+        props->OutputType = output.technology == DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HDMI ? ovrDisplayOutput_HDMI :
+            output.technology == DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DVI ? ovrDisplayOutput_DVI : ovrDisplayOutput_DP;
         props->DongleType = ovrDisplayDongle_None;
         props->UniqueId = Identity().target;
         return ReadTestEdid(props->EdidData) ? ovrSuccess : ovrError_Unsupported;
@@ -305,11 +299,14 @@ public:
         *out = nullptr;
         Trace("CreateSurface %dx%d rate=%d/%d format=%d", mode->Resolution.w, mode->Resolution.h,
             mode->RefreshRate.Numerator, mode->RefreshRate.Denominator, mode->Format);
-        if (mode->Resolution.w != 1440 || mode->Resolution.h != 2560 || mode->RefreshRate.Denominator <= 0 ||
-            mode->RefreshRate.Numerator < 79 * mode->RefreshRate.Denominator || mode->RefreshRate.Numerator > 81 * mode->RefreshRate.Denominator ||
+        // Release 1.4: the only accepted mode is the one in the session's EDID, within 1 Hz (Rift S: 1440x2560, 79-81 Hz).
+        const ArcRiftEdidMode& native = Mode();
+        if (!native.valid) { Trace("CreateSurface: session EDID missing or invalid; refusing"); return ovrError_Unsupported; }
+        if (mode->Resolution.w != int(native.width) || mode->Resolution.h != int(native.height) || mode->RefreshRate.Denominator <= 0 ||
+            mode->RefreshRate.Numerator < (native.nominalHz - 1) * mode->RefreshRate.Denominator || mode->RefreshRate.Numerator > (native.nominalHz + 1) * mode->RefreshRate.Denominator ||
             (mode->Format != OVR_FORMAT_R8G8B8A8_UNORM && mode->Format != OVR_FORMAT_R8G8B8A8_UNORM_SRGB)) return ovrError_Unsupported;
         std::lock_guard<std::mutex> guard(mutex);
-        HRESULT hr = InitializeRenderer(1440, 2560);
+        HRESULT hr = InitializeRenderer(native.width, native.height);
         if (FAILED(hr)) { Trace("Renderer failed %08lx", hr); return ovrError_Unsupported; }
         auto surface = new Surface;
         D3D11_TEXTURE2D_DESC desc{};
@@ -367,7 +364,7 @@ public:
     ovrResult GetPresentStats(ovrPresentStats* stats) override {
         if (!stats) return ovrError_InvalidParameter;
         memset(stats, 0, sizeof(*stats));
-        stats->RefreshRate = {80, 1};
+        stats->RefreshRate = {Mode().valid ? Mode().nominalHz : 80, 1};
         return ovrSuccess;
     }
     ovrResult GetPresentState(ovrBool* state) override { if (!state) return ovrError_InvalidParameter; *state = ovrFalse; return ovrSuccess; }
@@ -397,6 +394,8 @@ public:
         if (!Identity().valid) { Trace("Identity file arcrift-identity.txt missing or invalid; refusing to enumerate"); return ovrError_Unsupported; }
         PhysicalOutput output;
         char why[400] = "";
+        // Release 1.4 note: do not wait here for a late headset display. Meta powers the headset display on only after this
+        // call returns (session of 2026-11-13 20:14: an 8 s wait here delayed the power-on by 8 s and still failed).
         if (!GetPhysicalOutput(output, why, sizeof(why))) { TraceLookupFailure("Enumerate", why); return ovrError_Unsupported; }
         display->AddRef();
         *out = display;

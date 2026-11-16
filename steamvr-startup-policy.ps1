@@ -12,6 +12,20 @@ function Test-ArcRiftSteamVRStartup {
     return $ServerIds.Count -eq 1 -and $CompositorIds.Count -eq 1 -and $FreshStartupComplete
 }
 
+# Release 1.4: what SteamVR's compositor log says about a launch, as the number of sync-timeout lines in it. A lost or
+# hung GPU device always fails the launch. Sync timeouts fail it too, unless the caller tolerates them: a manual
+# session does, up to $Limit lines (one hitch writes up to three), because a running manual session only notes these
+# and its frame-rate, freeze and device-loss guards cover real trouble. Seen 2026-11-15 with SteamVR's render
+# resolution at 150 %: one "WaitForAcquire timed out" on the very first frame, 22 ms after "Startup Complete".
+function Get-ArcRiftBootstrapSyncCount {
+    param([string]$GraphicsTail, [bool]$TolerateSyncTimeouts, [int]$Limit = 6)
+    if ($GraphicsTail -match '(?i:DXGI_ERROR_DEVICE_REMOVED|DXGI_ERROR_DEVICE_HUNG)') { throw 'Graphics/synchronization failure during normal-user bootstrap.' }
+    $count = [regex]::Matches($GraphicsTail, '(?i:AcquireSync FAILED|ReleaseSync FAILED|WaitForAcquire timed out)').Count
+    if ($count -and -not $TolerateSyncTimeouts) { throw 'Graphics/synchronization failure during normal-user bootstrap.' }
+    if ($count -gt $Limit) { throw ('Graphics/synchronization failure during normal-user bootstrap (' + $count + ' SteamVR sync errors while starting).') }
+    return $count
+}
+
 function Read-ArcRiftStartupLog {
     param([string]$Path, [ref]$Offset)
     if (-not (Test-Path -LiteralPath $Path)) { return '' }

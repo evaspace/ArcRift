@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <vector>
 #include "arcrift_identity.h"
+#include "edid_mode.h"
 
 struct SavedSource {
     DWORD magic = 0x41525331;
@@ -118,11 +119,14 @@ int main(int argc, char** argv) {
     auto signal = c.modes[p.targetInfo.modeInfoIdx].targetMode.targetVideoSignalInfo;
     double hz = signal.vSyncFreq.Denominator ? double(signal.vSyncFreq.Numerator) / signal.vSyncFreq.Denominator : 0;
     printf("Original source=%ux%u scaling=%u target=%ux%u %.6fHz\n", source.width, source.height, p.targetInfo.scaling, signal.activeSize.cx, signal.activeSize.cy, hz);
-    if (signal.activeSize.cx != 1440 || signal.activeSize.cy != 2560 || hz < 79 || hz > 81) { puts("Native physical signal required; no changes."); return 1; }
+    // Release 1.4: the native mode comes from the session's EDID file (Rift S: 1440x2560, 79-81 Hz, as before).
+    const ArcRiftEdidMode native = ArcRiftLoadSessionMode(nullptr);
+    if (!native.valid) { puts("Session EDID missing or invalid; no changes."); return 1; }
+    if (signal.activeSize.cx != native.width || signal.activeSize.cy != native.height || hz < native.nominalHz - 1 || hz > native.nominalHz + 1) { puts("Native physical signal required; no changes."); return 1; }
     SavedSource saved;
     saved.adapter = p.sourceInfo.adapterId; saved.sourceId = p.sourceInfo.id;
     saved.source = source; saved.scaling = p.targetInfo.scaling;
-    source.width = 1440; source.height = 2560;
+    source.width = native.width; source.height = native.height;
     p.targetInfo.scaling = DISPLAYCONFIG_SCALING_IDENTITY;
     LONG r = c.Submit(SDC_VALIDATE);
     printf("Native desktop surface validation=%ld\n", r);
@@ -144,7 +148,7 @@ int main(int argc, char** argv) {
         const auto& s = after.modes[a.sourceInfo.modeInfoIdx].sourceMode;
         const auto& t = after.modes[a.targetInfo.modeInfoIdx].targetMode.targetVideoSignalInfo;
         printf("Applied source=%ux%u scaling=%u target=%ux%u clock=%llu\n", s.width, s.height, a.targetInfo.scaling, t.activeSize.cx, t.activeSize.cy, t.pixelRate);
-        confirmed = s.width == 1440 && s.height == 2560 && a.targetInfo.scaling == DISPLAYCONFIG_SCALING_IDENTITY &&
+        confirmed = s.width == native.width && s.height == native.height && a.targetInfo.scaling == DISPLAYCONFIG_SCALING_IDENTITY &&
             memcmp(&t, &signal, sizeof(signal)) == 0;
     }
     if (confirmed) {

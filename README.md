@@ -1,4 +1,4 @@
-# ArcRift 1.3: Oculus Rift S on Intel Arc
+# ArcRift 1.5: Oculus Rift S on Intel Arc
 
 by **funrun** · free and open source (MIT)
 
@@ -65,7 +65,16 @@ by Meta, Oculus, Intel or Valve.
   Meta or SteamVR exiting, a Windows display-driver reset, or low disk space.
 - Only notes SteamVR sync errors (a game running slowly) in `sync-hiccups.txt`; they never stop a session by themselves.
 - Pauses the freeze check while the headset is off, and resumes it when you put it back on.
-- If Meta's runtime stops responding for 30 s, restores everything automatically.
+- Keeps Meta's tracking on while the headset is off, so Meta does not pause it and then crash when it starts again
+  (see *Taking the headset off or putting it down* under Known issues).
+- If Meta's runtime crashes, restores everything automatically within about 2 s and notes Meta's own crash report in
+  `meta-crash.txt` in the session folder. Then it starts a fresh session by itself in a new window, with no
+  administrator prompt: put the headset on, and when it says VR ready, start your game again. It doesn't restart
+  after you pressed Stop & restore, if the restore wasn't verified, if Meta crashed within a minute of VR being
+  ready, or after three automatic restarts in a row.
+- If Meta's runtime stops responding for 30 s without crashing, restores everything automatically. Just before it
+  does, it saves what the frozen runtime was doing (`meta-hang-threads.txt` and `meta-hang.dmp`, about 50 MB) in the
+  session folder.
 - Records frame timings with PresentMon (`presentmon.csv` in each session folder). Delete `PresentMon.exe`
   to turn this off.
 
@@ -117,8 +126,38 @@ every time SteamVR starts.
   `system-info.txt` (card, driver, Windows build) into the session folder. If it fails on your card, please send
   that file with `transcript.txt` and the `physical-display-*.txt` files.
 
-- **Putting the headset down for a while:** after about 20 s without movement, Meta pauses tracking, and picking
-  the headset up again can freeze Meta's runtime. ArcRift notices and restores; just start a new session.
+- **Testers wanted (other Arc cards, Rift CV1).** Run **CHECK MY PC.cmd** and send the `compat-report-….txt` it
+  writes. It only reads: nothing on the PC is changed, no session is started, and no administrator rights are
+  needed. The report says which graphics card and driver you have, how Windows presents the headset display
+  (normal display, hidden head-mounted display, or not there), which display modes Windows offers for it, the
+  headset display's EDID and the Meta runtime's lines about the headset. Serial numbers are masked and other monitors are listed by model only; please still
+  read it before posting it publicly.
+
+- **Rift CV1: experimental and unconfirmed.** A CV1 (HDMI) can be set up and started like a Rift S, but no CV1
+  session has worked yet and the developer has no CV1 to test with. A CV1 session writes no EDID: it only asks
+  Windows to switch the headset display to its own mode (2160x1200 at 90 Hz) and back. If Windows does not offer
+  that mode on your card, the session stops before changing anything and says so. Plug the HDMI cable straight
+  into the Arc card (no adapter) and the headset's USB into a USB 3 port. Whatever happens, please send
+  `transcript.txt`, `bridge-log.txt` and `headset-modes-offered.txt` from the newest `d3d11-…` folder.
+  **If the session says Windows does not offer the Rift CV1 display mode** (seen on an Arc B580), run
+  **CV1 MODE TEST.cmd** (about 3 minutes, needs administrator approval). It tries a few temporary display
+  descriptions on the headset display only, puts everything back, and writes `cv1-mode-test-….txt` (no serial
+  numbers): please send that file. If it finds one that works it saves `cv1-override.edid`, and the next session
+  uses it. That file contains your headset serial; don't post it.
+
+- **Taking the headset off or putting it down:** about 20 s after the headset comes off and sits still, Meta pauses
+  tracking, and starting it again when the headset moves can crash Meta's runtime. Since 1.5 a session tells Meta to
+  keep tracking on the whole time (Meta's own `ForceSensorTracking` setting, taken away again when the session
+  restores). The session window says "Tracking stays on while the headset is off" once Meta has confirmed it. The
+  headset display still switches off when you take it off; only the cameras and tracking keep running.
+  **Not yet confirmed in a real session.** If Meta's runtime crashes anyway, ArcRift notices within a couple of
+  seconds, restores, and starts a fresh session by itself; your game loses VR and needs starting again. The Debug
+  Tool's proximity bypass does **not** stop the pause (tested 15 Nov with the bypass on and the Debug Tool open).
+  Covering the headset's proximity sensor does, because Meta never pauses while it thinks the headset is worn; the
+  display then stays lit, so keep the lenses out of sunlight and remove the cover afterwards. Why Meta's runtime
+  crashes when tracking starts again is not known. Meta saves its own crash report in
+  `%LOCALAPPDATA%\Oculus\OVRServerBreakpad`, and the session folder gets `meta-crash.txt` saying which one it is.
+  The report holds your Meta user ID, so don't post it publicly.
 - **Busy VRChat worlds** are mostly limited by the CPU: lower *Maximum Shown Avatars*, hide *Very Poor* avatars,
   and enable the particle limiter.
 - **No ASW:** Meta's frame smoothing (ASW) does not run on Intel Arc.
@@ -130,7 +169,11 @@ every time SteamVR starts.
 |---|---|
 | `ArcRift Control.exe` | The app: status, start/stop, recovery, setup |
 | `START MANUAL SESSION.cmd`, `STOP AND RESTORE.cmd`, `RECOVER.cmd` | The same actions without the app |
+| `CHECK MY PC.cmd`, `compat-report.ps1` | Read-only compatibility report for testers (see Known issues) |
 | `test-ovr-d3d11.ps1` and the other `.ps1` files | The session script that sets up, guards and restores |
+| `display-mode.ps1` | Reads and switches one display's Windows mode (Rift CV1 sessions only) |
+| `CV1 MODE TEST.cmd`, `cv1-mode-probe.ps1` | Rift CV1 only: finds a display mode the graphics driver accepts (see Known issues) |
+| `cv1-override.edid` | Written by CV1 MODE TEST when it finds a working mode; contains the headset serial |
 | `arc_rift_bridge.dll`, `native_source_*.exe`, `display_probe.exe`, `bridge_selftest.exe`, `arcrift_boundary.exe` | Bridge and helpers (built by `BUILD-RELEASE.cmd`) |
 | `boundary-saved.txt`, `boundary-status.json`, `boundary-log.txt` | Your saved room boundary and the boundary helper's status/log |
 | `release-manifest.json` | SHA-256 of each program; a session refuses to start if any differs |
@@ -143,7 +186,8 @@ every time SteamVR starts.
 
 Session folders (`d3d11-…`), `arcrift-config.json` and `arcrift-identity.txt` contain device IDs, and
 Meta's logs contain your headset serial. **Don't post them publicly**; when asking for help, share only
-the lines you need.
+the lines you need. `meta-hang.dmp` is a copy of part of the Meta runtime's memory and can hold account details:
+never post it publicly.
 
 ## Licences and credits
 

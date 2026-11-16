@@ -1,9 +1,33 @@
 # One bounded integration attempt. Run elevated; never an installation script.
 param([switch]$Visual, [switch]$NativeTiming, [switch]$LinkDiagnostics, [switch]$NativeSource, [switch]$Stereo, [switch]$TrackedScene, [switch]$SteamVR,
-    [ValidateRange(15,600)][int]$SteamVRSeconds = 30, [switch]$IsolatedHeadsetTrial, [switch]$LegacyCheckpointTrial, [switch]$NoReadbackSteamTrial, [switch]$UserLaunchSteamTrial, [switch]$StartupIdentityHeadsetTrial, [switch]$LegacyCheckpointSteamTrial, [switch]$OriginalSteamVRBaselineTrial, [switch]$DashboardSameIntegrityTrial, [switch]$DashboardNormalUserTrial, [switch]$VRChatTrial, [switch]$ManualSession, [switch]$GuardianSetup)
+    [ValidateRange(15,600)][int]$SteamVRSeconds = 30, [switch]$IsolatedHeadsetTrial, [switch]$LegacyCheckpointTrial, [switch]$NoReadbackSteamTrial, [switch]$UserLaunchSteamTrial, [switch]$StartupIdentityHeadsetTrial, [switch]$LegacyCheckpointSteamTrial, [switch]$OriginalSteamVRBaselineTrial, [switch]$DashboardSameIntegrityTrial, [switch]$DashboardNormalUserTrial, [switch]$VRChatTrial, [switch]$ManualSession, [switch]$GuardianSetup,
+    [ValidateRange(0,3)][int]$AutoRestartCount = 0, [int]$WaitForHarnessPid = 0)
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
 Set-Location -LiteralPath $root
+$harnessScript = $PSCommandPath  # this file, for an automatic restart
+$harnessParameters = @{}  # this session's switches, so an automatic restart can pass on the same ones
+foreach ($kv in $PSBoundParameters.GetEnumerator()) { $harnessParameters[$kv.Key] = $kv.Value }
+# Release 1.4: turn off QuickEdit for this window only. With it on, one click in the window starts a text selection
+# and PowerShell then blocks on its next line of output until the selection is cleared, freezing every guard. Seen
+# 2026-11-15: the loop stopped for 11 minutes on "Headset on" and missed a Meta crash and a Stop & restore.
+try {
+    Add-Type -Namespace ArcRift -Name ConsoleMode -MemberDefinition '[DllImport("kernel32.dll")] public static extern IntPtr GetStdHandle(int which); [DllImport("kernel32.dll")] public static extern bool GetConsoleMode(IntPtr handle, out uint mode); [DllImport("kernel32.dll")] public static extern bool SetConsoleMode(IntPtr handle, uint mode);'
+    $consoleIn = [ArcRift.ConsoleMode]::GetStdHandle(-10)
+    [uint32]$consoleInMode = 0
+    if ([ArcRift.ConsoleMode]::GetConsoleMode($consoleIn, [ref]$consoleInMode)) {
+        # ENABLE_EXTENDED_FLAGS (0x80) must be set for the QuickEdit bit (0x40) to be changed.
+        [void][ArcRift.ConsoleMode]::SetConsoleMode($consoleIn, (($consoleInMode -bor 0x80) -band (-bnot 0x40)))
+    }
+} catch {}
+if ($WaitForHarnessPid -gt 0) {
+    # Release 1.4 automatic restart: the session that started this one must finish exiting (it has already restored
+    # and released the folder lock), and SteamVR must be gone, or the start-up checks below refuse to run.
+    Write-Host 'Automatic restart after a Meta runtime crash: waiting for the previous session window to close...'
+    try { $previousHarness = Get-Process -Id $WaitForHarnessPid -ErrorAction SilentlyContinue; if ($previousHarness) { [void]$previousHarness.WaitForExit(120000) } } catch {}
+    $steamVRGoneBy = (Get-Date).AddSeconds(30)
+    while ((Get-Process vrserver,vrcompositor,vrmonitor -ErrorAction SilentlyContinue) -and (Get-Date) -lt $steamVRGoneBy) { Start-Sleep -Milliseconds 500 }
+}
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $out = Join-Path $root ('d3d11-' + $stamp)
 New-Item -ItemType Directory -Path $out | Out-Null
@@ -22,7 +46,11 @@ $steamBin = $null
 $metaRuntime = $null
 $start = Get-Date
 $failed = $false
+$metaCrashAt = $null  # set when the session stops because Meta's runtime crashed (decides the automatic restart)
 $edidChanged = $false
+# Release 1.4 (Rift CV1): the display mode a CV1 session switches to, and whether it has switched.
+$modeSwitch = $null
+$modeChanged = $false
 $sessionLock = $null
 $activeSession = Join-Path $root 'active-test.xml'
 $sessionLockPath = Join-Path $root 'active-test.lock'
@@ -45,9 +73,14 @@ $bridgeLowFpsCount = 0
 $headsetOff = $false
 $headsetOffSince = $null
 $metaLogPath = $null
+$trackingForcedChecked = $false  # 1.4: said once whether Meta confirmed ForceSensorTracking
+$trackingPauseWarned = $false    # 1.4: said once that Meta paused tracking anyway
 [long]$metaLogOffset = 0
 $metaLogCheckAt = Get-Date
 $metaLastGrowth = Get-Date
+$metaCrashDir = Join-Path $env:LOCALAPPDATA 'Oculus\OVRServerBreakpad'
+$metaCrashKnown = $null
+$metaCrashCheckAt = Get-Date
 $presentMonProcess = $null
 $steamGraphicsLog = $null
 $presentMonGames = @('VRChat.exe')
@@ -73,12 +106,69 @@ $arcConfigError = $null
 $gpuNote = $null
 $monitorInstance = ''
 $targetId = 0
+# Release 1.4: what is specific to one headset model lives in a profile instead of being written out through the
+# script. Setup may save "headsetProfile" in arcrift-config.json; a config without it is a Rift S, as before.
+#   Width/Height/PixelClock: the one display mode a session may apply and must then see on the cable.
+#   EdidId: how display_probe.exe prints that EDID's maker and product (d23e = OVR).
+#   OwnEdid: $false = the headset shows a placeholder display, so a session gives it a temporary EDID (Rift S).
+#            $true  = the headset's own EDID already holds its real mode and serial, so a session only switches
+#                     Windows to that mode and back; no EDID is written (Rift CV1).
+#   Cable: what the headset's display cable is called in messages.
+# The Rift CV1 profile is EXPERIMENTAL: it is built from one tester's compatibility report (Arc B580, HDMI) and no
+# CV1 session has been confirmed yet. A CV1 session checks that Windows offers the mode before it changes anything.
+$headsetProfiles = @{
+    'rift-s' = @{ Name = 'Rift S'; Width = 1440; Height = 2560; PixelClock = 571570000; Hz = 80; EdidId = 'd23e:0012'; OwnEdid = $false; Cable = 'DisplayPort' }
+    'rift-cv1' = @{ Name = 'Rift CV1'; Width = 2160; Height = 1200; PixelClock = 296750000; Hz = 90; EdidId = 'd23e:0004'; OwnEdid = $true; Cable = 'HDMI' }
+}
+$headsetProfile = $headsetProfiles['rift-s']
+# The display mode in an EDID's first detailed timing, as display_probe.exe reports a signal.
+function Get-ArcRiftEdidMode([byte[]]$Edid) {
+    $w = [int]$Edid[56] + (([int]$Edid[58] -band 240) * 16)
+    $h = [int]$Edid[59] + (([int]$Edid[61] -band 240) * 16)
+    return [pscustomobject]@{
+        Width = $w; Height = $h
+        TotalWidth = $w + [int]$Edid[57] + (([int]$Edid[58] -band 15) * 256)
+        TotalHeight = $h + [int]$Edid[60] + (([int]$Edid[61] -band 15) * 256)
+        PixelClock = ([int]$Edid[54] + 256 * [int]$Edid[55]) * 10000
+    }
+}
+# Release 1.4 (Rift CV1): from the modes Windows offers for the headset display ("width height hertz" strings), the
+# profile's mode at the refresh rate closest to the profile's (Windows may list 89.998 Hz as 89 or 90); $null if none.
+function Select-ArcRiftHeadsetMode([string[]]$Offered) {
+    $fit = @($Offered | Where-Object { $_ } | ForEach-Object { $p = $_ -split ' '; [pscustomobject]@{ W = [int]$p[0]; H = [int]$p[1]; Hz = [int]$p[2] } } |
+        Where-Object { $_.W -eq $headsetProfile.Width -and $_.H -eq $headsetProfile.Height -and $_.Hz -ge ($headsetProfile.Hz - 1) -and $_.Hz -le ($headsetProfile.Hz + 1) } |
+        Sort-Object { [math]::Abs($_.Hz - $headsetProfile.Hz) }, { -$_.Hz })
+    if ($fit.Count) { return $fit[0] }
+    return $null
+}
+# Release 1.4 (Rift CV1): the temporary EDID that "CV1 MODE TEST.cmd" found to work on this PC (cv1-override.edid).
+# It is only accepted when it is this headset's own EDID with nothing changed that the headset could notice: same
+# maker, product and serial, same picture size, same line and frame layout, and a pixel clock within 0.5 %.
+function Get-ArcRiftCv1Override([string]$Path, [byte[]]$Own) {
+    $o = [IO.File]::ReadAllBytes($Path)
+    $sum = 0; foreach ($b in $o) { $sum += $b }
+    if ($o.Length -ne 128 -or ($sum % 256) -ne 0) { throw 'cv1-override.edid is damaged. Delete it and run "CV1 MODE TEST.cmd" again. No changes made.' }
+    $ownMode = Get-ArcRiftEdidMode $Own
+    $newMode = Get-ArcRiftEdidMode $o
+    $sameHeadset = $true
+    foreach ($i in ((8..15) + (90..107))) { if ($o[$i] -ne $Own[$i]) { $sameHeadset = $false } }
+    if (-not $sameHeadset -or $newMode.Width -ne $ownMode.Width -or $newMode.Height -ne $ownMode.Height -or $newMode.TotalWidth -ne $ownMode.TotalWidth -or $newMode.TotalHeight -ne $ownMode.TotalHeight -or [math]::Abs($newMode.PixelClock - $ownMode.PixelClock) -gt ($ownMode.PixelClock * 0.005)) {
+        throw 'cv1-override.edid is not for this headset, or changes more than a session allows. Delete it and run "CV1 MODE TEST.cmd" again. No changes made.'
+    }
+    return ,$o
+}
 try {
     $arcConfigPath = Join-Path $root 'arcrift-config.json'
     if (-not (Test-Path -LiteralPath $arcConfigPath)) { throw 'No headset setup found. Run Setup in ArcRift Control first (arcrift-config.json is missing).' }
     $arcConfig = Get-Content -LiteralPath $arcConfigPath -Raw | ConvertFrom-Json
     $monitorInstance = [string]$arcConfig.monitorInstance
     $targetId = [int]$arcConfig.targetId
+    $profileName = ([string]$arcConfig.headsetProfile).Trim().ToLowerInvariant()
+    # Setup does not save a profile yet. A headset display that identifies itself as OVR0004 is a Rift CV1; anything
+    # else (the Rift S placeholder display) is a Rift S, as before.
+    if (-not $profileName) { $profileName = if ($monitorInstance -match '^(?i)DISPLAY\\OVR0004\\') { 'rift-cv1' } else { 'rift-s' } }
+    if (-not $headsetProfiles.ContainsKey($profileName)) { throw ('This ArcRift version has no headset profile called "' + $profileName + '" (arcrift-config.json). Supported: ' + (($headsetProfiles.Keys | Sort-Object) -join ', ') + '. No changes made.') }
+    $headsetProfile = $headsetProfiles[$profileName]
     $gpuMatch = [regex]::Match([string]$arcConfig.gpuPnpMatch, '(?i)VEN_([0-9A-F]{4})&DEV_([0-9A-F]{4})')
     if ($monitorInstance -notmatch '^(?i)DISPLAY\\[^\\]+\\[^\\]+$' -or $targetId -le 0 -or -not $gpuMatch.Success) { throw 'arcrift-config.json is incomplete. Run Setup in ArcRift Control again.' }
     if ($gpuMatch.Groups[1].Value -ne '8086') { throw 'The GPU saved by Setup is not an Intel GPU; this release only supports Intel Arc.' }
@@ -106,6 +196,21 @@ try {
     Set-Content -LiteralPath (Join-Path $root 'arcrift-identity.txt') -Value $identityLines -Encoding Ascii
     # Rift S display mode (EDID) for this headset: public Rift S capture timings + this headset's serial,
     # which Meta uses to pair the display with the headset. Rebuilt every session; never flashed to hardware.
+    if ($headsetProfile.OwnEdid) {
+        # Rift CV1: the headset display's own EDID, exactly as Windows read it from the headset (its first 128 bytes).
+        # It already holds the real mode and the serial Meta pairs the display with, so nothing is made up here and
+        # nothing is written to the headset or to Windows. The bridge hands these bytes to Meta.
+        $ownEdid = $null
+        try { $ownEdid = [byte[]](Get-ItemProperty -LiteralPath ('HKLM:\SYSTEM\CurrentControlSet\Enum\' + $monitorInstance + '\Device Parameters') -Name EDID -ErrorAction Stop).EDID } catch { }
+        if (-not $ownEdid -or $ownEdid.Length -lt 128) { throw ('Windows has no EDID stored for the ' + $headsetProfile.Name + ' display. Plug the headset in (USB and ' + $headsetProfile.Cable + '), then run Setup again. No changes made.') }
+        $edidBytes = [byte[]]::new(128)
+        [Array]::Copy($ownEdid, $edidBytes, 128)
+        $edidSum = 0; for ($i = 0; $i -lt 128; $i++) { $edidSum += $edidBytes[$i] }
+        $ownMode = Get-ArcRiftEdidMode $edidBytes
+        if (($edidSum % 256) -ne 0 -or $edidBytes[8] -ne 0x3e -or $edidBytes[9] -ne 0xd2 -or $ownMode.Width -ne $headsetProfile.Width -or $ownMode.Height -ne $headsetProfile.Height -or $ownMode.PixelClock -ne $headsetProfile.PixelClock) {
+            throw ('The headset display''s own EDID is not the expected ' + $headsetProfile.Name + ' one (' + $headsetProfile.Width + 'x' + $headsetProfile.Height + ', pixel clock ' + $headsetProfile.PixelClock + '); found ' + $ownMode.Width + 'x' + $ownMode.Height + ', pixel clock ' + $ownMode.PixelClock + '. No changes made.')
+        }
+    } else {
     $serial = ([string]$arcConfig.headsetSerial).Trim()
     if ($serial -notmatch '^[A-Za-z0-9]{6,32}$') { throw 'The headset serial number is missing. Run Setup again with the Meta Horizon app open and the headset connected.' }
     $edidTemplate = '00ffffffffffff003ed2120000000000011d0104a50000000e000000000000000000000000000101010101010101010101010101010145dfa0385100eea5d20cf10c000000000010000000ff0030303030303030303030303030000000fc005269667420530a20202020202000000010000000000000000000000000000000e6'
@@ -116,6 +221,7 @@ try {
     for ($i = 0; $i -lt 13; $i++) { $edidBytes[77 + $i] = $serialBytes[$i] }
     $edidSum = 0; for ($i = 0; $i -lt 127; $i++) { $edidSum += $edidBytes[$i] }
     $edidBytes[127] = [byte]((256 - ($edidSum % 256)) % 256)
+    } # end of the Rift S (temporary EDID) branch
     [IO.File]::WriteAllBytes((Join-Path $root 'rift-s-native-test.edid'), $edidBytes)
     . (Join-Path $root 'install-paths.ps1')
     $metaRuntime = Get-ArcRiftMetaRuntimePath
@@ -159,12 +265,13 @@ function Get-ArcRiftHeadsetLayoutKey($Layouts, [int]$Target) {
 # signal=1440x2560; the original generic EDID means Windows never picked up the temporary display mode.
 function Get-ArcRiftHeadsetModeReport([string]$Probe, [int]$Target, [bool]$OverridePresent) {
     $m = [regex]::Match($Probe, '(?m)^\s*target=' + $Target + ' [^\r\n]*' + $activePathFlags + '[^\r\n]*\r?\n\s*name=([^\r\n]*?) path=[^\r\n]*?(?i:' + [regex]::Escape($headsetPathId) + ')[^\r\n]*?EDID=(\S+)\s*\r?\n\s*signal=(\S+)[^\r\n]*?vSync=(\d+)/(\d+)')
-    $override = if ($OverridePresent) { 'temporary EDID is still set' } else { 'temporary EDID is missing from the registry' }
+    $override = if ($headsetProfile.OwnEdid -and -not $useTemporaryEdid) { 'this headset uses its own EDID, so only the Windows display mode was switched' } elseif ($OverridePresent) { 'temporary EDID is still set' } else { 'temporary EDID is missing from the registry' }
     if (-not $m.Success) { return ('headset display is not active in Windows; ' + $override) }
     $hz = if ([double]$m.Groups[5].Value) { [math]::Round([double]$m.Groups[4].Value / [double]$m.Groups[5].Value, 1) } else { 0 }
     $signal = $m.Groups[3].Value + ' at ' + $hz + ' Hz'
     $name = if ($m.Groups[1].Value) { $m.Groups[1].Value } else { 'no name' }
-    if ($m.Groups[2].Value -eq 'd23e:0012') { return ('Windows uses the temporary Rift S EDID (' + $name + ') but the headset runs at ' + $signal + '; ' + $override) }
+    if ($headsetProfile.OwnEdid) { return ('the ' + $headsetProfile.Name + ' display (' + $name + ') runs at ' + $signal + '; ' + $override) }
+    if ($m.Groups[2].Value -eq $headsetProfile.EdidId) { return ('Windows uses the temporary ' + $headsetProfile.Name + ' EDID (' + $name + ') but the headset runs at ' + $signal + '; ' + $override) }
     return ('Windows still shows the original headset EDID ' + $m.Groups[2].Value + ' (' + $name + ') at ' + $signal + ', so the temporary display mode was not picked up; ' + $override)
 }
 function Stop-ArcRiftMetaRuntime([int]$TimeoutSeconds = 20) {
@@ -286,6 +393,137 @@ function Start-ArcRiftPresentMon {
         Write-Output ('Frame-timing recorder (PresentMon) started: ' + $csv + ' in this session folder (' + ($script:presentMonGames -join ', ') + ').')
     } catch { Write-Output ('PresentMon not started (session unaffected): ' + $_.Exception.Message) }
 }
+function Get-ArcRiftNewMetaCrash {
+    # Release 1.4: Meta's runtime writes its own crash report (Breakpad: <id>.dmp, later <id>.dmp.processed, plus
+    # <id>.txt) to %LOCALAPPDATA%\Oculus\OVRServerBreakpad when it crashes. Every "Meta stopped responding" stop
+    # checked so far was such a crash, on the thread that had just logged StartTracking; the process then lingers
+    # with one thread, so it never shows as exited. The first call only remembers the reports already there.
+    # Returns the new reports (newest first), or nothing. Only lists the folder; never opens a report.
+    $files = @()
+    try { if (Test-Path -LiteralPath $script:metaCrashDir) { $files = @(Get-ChildItem -LiteralPath $script:metaCrashDir -File -ErrorAction SilentlyContinue) } } catch {}
+    $idOf = { param($f) if ($f.Name -match '^([0-9a-fA-F-]{36})') { $Matches[1].ToLowerInvariant() } else { $f.Name } }
+    if ($null -eq $script:metaCrashKnown) {
+        $script:metaCrashKnown = @{}
+        foreach ($f in $files) { $script:metaCrashKnown[(& $idOf $f)] = $true }
+        return
+    }
+    $new = @($files | Where-Object { -not $script:metaCrashKnown.ContainsKey((& $idOf $_)) } | Sort-Object LastWriteTime -Descending)
+    foreach ($f in $new) { $script:metaCrashKnown[(& $idOf $f)] = $true }
+    $new
+}
+function Get-ArcRiftAutoRestartDecision {
+    # Release 1.4: whether a session that just ended should start a fresh one by itself. Returns '' to restart, or the
+    # sentence to show for not restarting ($null when it was never a candidate: not a manual session, or no Meta crash).
+    param([bool]$Manual, [bool]$Guardian, $CrashAt, [bool]$RollbackVerified, [bool]$StopRequested, $ReadyAt, [int]$Count)
+    if (-not $Manual -or $Guardian -or -not $CrashAt) { return $null }
+    if ($StopRequested) { return $null }  # you pressed Stop & restore: never undo that
+    if (-not $RollbackVerified) { return 'Not restarting automatically: the restore was not verified. Use Recover in ArcRift Control.' }
+    if (-not $ReadyAt) { return 'Not restarting automatically: Meta crashed before the session was ready. Start a new session from ArcRift Control.' }
+    if ((([datetime]$CrashAt) - ([datetime]$ReadyAt)).TotalSeconds -lt 60) { return 'Not restarting automatically: Meta crashed within a minute of the session becoming ready, which is not the known headset-down crash. Start a new session from ArcRift Control.' }
+    if ($Count -ge 3) { return 'Not restarting automatically: this was already the third automatic restart in a row. Start a new session from ArcRift Control.' }
+    return ''
+}
+function Start-ArcRiftAutoRestart {
+    # Opens the next session in a new window. This window is already elevated, so no administrator prompt appears.
+    # Same switches as this session, plus the restart count and this PID (the new session waits for this one to exit).
+    if (-not $script:harnessScript -or -not (Test-Path -LiteralPath $script:harnessScript)) { throw 'the session script path is unknown.' }
+    $restartArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $script:harnessScript + '"'))
+    foreach ($k in $script:harnessParameters.Keys) {
+        if ($k -in 'AutoRestartCount', 'WaitForHarnessPid') { continue }
+        $v = $script:harnessParameters[$k]
+        if ($v -is [System.Management.Automation.SwitchParameter]) { if ($v.IsPresent) { $restartArgs += '-' + $k } }
+        else { $restartArgs += '-' + $k; $restartArgs += [string]$v }
+    }
+    $restartArgs += '-AutoRestartCount', [string]($AutoRestartCount + 1), '-WaitForHarnessPid', [string]$PID
+    $next = Start-Process powershell.exe -ArgumentList ($restartArgs -join ' ') -WorkingDirectory $root -PassThru
+    ('Automatic restart ' + ($AutoRestartCount + 1) + ' of 3 started at ' + (Get-Date).ToString('o') + ' as PID ' + $next.Id) | Set-Content -LiteralPath (Join-Path $out 'auto-restart.txt')
+    Write-Output ('Restarting automatically in a new window (restart ' + ($AutoRestartCount + 1) + ' of 3). Put the headset on; when it says VR ready, start your game again. Press Stop & restore to end it.')
+}
+function Save-ArcRiftMetaCrashRecord($Reports) {
+    # Notes Meta's crash report in the session folder. The report itself stays where Meta put it.
+    try {
+        $lines = @()
+        $lines += 'Meta runtime (OVRServer_x64) crashed. Seen by ArcRift at ' + (Get-Date).ToString('o') + '.'
+        $lines += 'Meta''s own crash report, written at ' + $Reports[0].LastWriteTime.ToString('o') + ':'
+        foreach ($r in $Reports) { $lines += '  ' + $r.FullName + ' (' + $r.Length + ' bytes)' }
+        $lines += ''
+        $lines += 'The crash happened inside Meta''s runtime; its log (Service_*.txt, copied to this folder) ends at the crash.'
+        $lines += 'These reports hold private data from Meta''s runtime (including your Meta user ID): do not post them publicly.'
+        $lines | Set-Content -LiteralPath (Join-Path $out 'meta-crash.txt')
+        Write-Output ('Meta runtime crash recorded in this session folder: meta-crash.txt (Meta''s own report: ' + $Reports[0].Name + ').')
+    } catch { Write-Output ('Meta crash record note (restore unaffected): ' + $_.Exception.Message) }
+}
+function Save-ArcRiftMetaHangRecord {
+    # Release 1.4: when the freeze watchdog fires, record what Meta's hung runtime is doing before it is stopped, so the
+    # cause can be found. Writes meta-hang-threads.txt (every thread's state and the CPU it used over 1 s: all waiting
+    # means a deadlock, one busy thread means a spin; the IDs are the ones in Meta's Service log) and meta-hang.dmp
+    # (thread stacks, for WinDbg). Only reads Meta's process. Runs in a child PowerShell with a time limit so it can
+    # never hold up the restore; any failure is only noted.
+    $job = $null
+    try {
+        $hung = Get-Process OVRServer_x64 -ErrorAction SilentlyContinue | Select-Object -First 1
+        if (-not $hung) { return }
+        if ((New-Object IO.DriveInfo ([IO.Path]::GetPathRoot($out))).AvailableFreeSpace -lt 3GB) { Write-Output 'Meta hang record skipped: less than 3 GB free.'; return }
+        $job = Start-Job -ArgumentList $hung.Id,$out -ScriptBlock {
+            param([int]$id, [string]$dir)
+            $ErrorActionPreference = 'Stop'
+            $notes = @()
+            try {
+                $before = @{}
+                foreach ($t in (Get-Process -Id $id).Threads) { try { $before[$t.Id] = $t.TotalProcessorTime.TotalMilliseconds } catch {} }
+                Start-Sleep -Seconds 1
+                $busy = 0
+                $rows = foreach ($t in (Get-Process -Id $id).Threads) {
+                    $cpu = $null; try { $cpu = $t.TotalProcessorTime.TotalMilliseconds } catch {}
+                    $state = [string]$t.ThreadState; $why = ''
+                    if ($state -eq 'Wait') { try { $why = [string]$t.WaitReason } catch {} }
+                    $delta = ''
+                    if ($null -ne $cpu -and $before.ContainsKey($t.Id)) { $delta = [math]::Round($cpu - $before[$t.Id]); if ($delta -ge 100) { $busy++ } }
+                    $total = ''; if ($null -ne $cpu) { $total = [math]::Round($cpu) }
+                    '{0,7}  {1,-10} {2,-18} {3,8} {4,12} {5,10}' -f $t.Id, $state, $why, $t.CurrentPriority, $total, $delta
+                }
+                $rows = @($rows)
+                $head = @()
+                $head += 'Meta runtime (OVRServer_x64 PID ' + $id + ') threads at ' + (Get-Date).ToString('o') + ', taken when its log had been silent for 30 s.'
+                $head += [string]$rows.Count + ' threads, ' + $busy + ' busy (100 ms or more of CPU in the 1 s sample).'
+                $head += ''
+                $head += '{0,7}  {1,-10} {2,-18} {3,8} {4,12} {5,10}' -f 'Thread','State','Waiting for','Priority','CPU ms','CPU ms/1s'
+                $head + $rows | Set-Content -LiteralPath (Join-Path $dir 'meta-hang-threads.txt')
+                $notes += 'meta-hang-threads.txt (' + $rows.Count + ' threads, ' + $busy + ' busy)'
+            } catch { $notes += 'thread list failed: ' + $_.Exception.Message }
+            $dump = Join-Path $dir 'meta-hang.dmp'
+            try {
+                Add-Type -Namespace ArcRift -Name HangDump -MemberDefinition '[DllImport("dbghelp.dll", SetLastError = true)] public static extern bool MiniDumpWriteDump(IntPtr process, uint processId, Microsoft.Win32.SafeHandles.SafeFileHandle file, uint dumpType, IntPtr exception, IntPtr userStream, IntPtr callback); [DllImport("kernel32.dll", SetLastError = true)] public static extern IntPtr OpenProcess(uint access, bool inherit, uint processId); [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr handle);'
+                # Open only what the dump needs (query + read memory + duplicate handles). Process.Handle asks for full
+                # access and comes back empty when that is refused, which made the first real record fail with a null.
+                $proc = [ArcRift.HangDump]::OpenProcess([uint32]0x0450, $false, [uint32]$id)
+                if ($proc -eq [IntPtr]::Zero) { throw ('could not open Meta''s process (error {0}); it may already be exiting' -f [Runtime.InteropServices.Marshal]::GetLastWin32Error()) }
+                $file = $null
+                try {
+                    $file = [IO.File]::Create($dump)
+                    # Thread stacks plus module globals, handles and the memory the stacks point at: enough to see who
+                    # waits on what, without copying the whole process (no full heap).
+                    $ok = [ArcRift.HangDump]::MiniDumpWriteDump($proc, [uint32]$id, $file.SafeFileHandle, [uint32]0x1165, [IntPtr]::Zero, [IntPtr]::Zero, [IntPtr]::Zero)
+                    $code = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                } finally { if ($file) { $file.Dispose() }; [void][ArcRift.HangDump]::CloseHandle($proc) }
+                if (-not $ok) { throw ('MiniDumpWriteDump error 0x{0:x8}' -f $code) }
+                $notes += 'meta-hang.dmp (' + [math]::Round((Get-Item -LiteralPath $dump).Length / 1MB) + ' MB)'
+            } catch {
+                Remove-Item -LiteralPath $dump -ErrorAction SilentlyContinue
+                $notes += 'dump failed: ' + $_.Exception.Message
+            }
+            $notes -join '; '
+        }
+        if (Wait-Job $job -Timeout 30) {
+            Write-Output ('Meta runtime hang recorded in this session folder: ' + (@(Receive-Job $job) -join '; ') + '. These files hold private data from Meta''s runtime: do not post them publicly.')
+        } else {
+            Write-Output 'Meta hang record took over 30 s and was abandoned (restore unaffected).'
+            Stop-Job $job -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath (Join-Path $out 'meta-hang.dmp') -ErrorAction SilentlyContinue
+        }
+    } catch { Write-Output ('Meta hang record note (restore unaffected): ' + $_.Exception.Message) }
+    finally { if ($job) { Remove-Job $job -Force -ErrorAction SilentlyContinue } }
+}
 function Read-AppendedBridgeLog([string]$Path, [ref]$Offset, [switch]$OnlyIfGrown) {
     $stream = $null
     $reader = $null
@@ -318,7 +556,10 @@ function Assert-ArcRiftNoVRRunning {
 Start-Transcript -Path (Join-Path $out 'transcript.txt')
 try {
     if ($arcConfigError) { throw $arcConfigError }
+    $null = Get-ArcRiftNewMetaCrash  # remember Meta's existing crash reports, so only new ones count
+
     Write-Output ('Headset display ' + $monitorInstance + ' (target ' + $targetId + ') from Setup.')
+    if ($AutoRestartCount -gt 0) { Write-Output ('Automatic restart ' + $AutoRestartCount + ' of 3 after a Meta runtime crash (previous session window PID ' + $WaitForHarnessPid + ').') }
     if ($gpuNote) { Write-Output $gpuNote }
     # Release 1.3 (other Intel cards): record which card, driver and Windows build this session ran on, so a report
     # from an untested card says what it was. Read-only; never fails the session.
@@ -361,7 +602,8 @@ try {
             $savedTools = $root
             if ($DashboardNormalUserTrial) {
                 if ($VRChatTrial) {
-                    Write-Output 'ArcRift session: Rift S bridge with normal-user SteamVR launch. No game files or anti-cheat are touched.'
+                    Write-Output ('ArcRift session: ' + $headsetProfile.Name + ' bridge with normal-user SteamVR launch. No game files or anti-cheat are touched.')
+                    if ($headsetProfile.OwnEdid) { Write-Output ('EXPERIMENTAL: no ' + $headsetProfile.Name + ' session has been confirmed yet. Whatever happens, please send transcript.txt, bridge-log.txt and headset-modes-offered.txt from the newest d3d11 folder (check them for serial numbers first).') }
                 } else {
                     Write-Output 'Dashboard IPC trial: EXACT original DLL/native helper/EDID; SteamVR runs as normal user to match Steam. Sequenced diagnostic, 30 seconds, no games, full rollback. Desktop baseline untouched.'
                 }
@@ -455,6 +697,7 @@ try {
     }
     if ((Get-Service OVRService).Status -ne 'Running') { throw 'Service is not in the expected original running state.' }
     if (Get-Process OculusDash -ErrorAction SilentlyContinue) { throw 'Dash is already running; refusing to interrupt an existing session.' }
+    if ((Test-Path -LiteralPath $edidKey) -and (Test-Path -LiteralPath (Join-Path $root 'cv1-probe-active.txt'))) { throw 'A display mode from an interrupted CV1 MODE TEST is still applied to the headset display. Run "CV1 MODE TEST.cmd" again (it removes it first), then start the session; no changes made.' }
     if (Test-Path -LiteralPath $edidKey) { throw 'The headset display mode from an earlier ArcRift session is still applied, but no unrestored session was found to restore it from. Run RECOVER.cmd in the ArcRift folder you used last; no changes made.' }
     # Release 1.1.2: never back up "original" settings over a session that was not restored yet.
     if (Test-Path -LiteralPath $activeSession) { throw 'The previous session was not restored (active-test.xml exists). Run Recover in ArcRift Control or RECOVER.cmd first; no changes made.' }
@@ -473,18 +716,80 @@ try {
     & (Join-Path $root 'display_probe.exe') | Out-File -Encoding utf8 (Join-Path $out 'physical-baseline.txt')
     if ($LASTEXITCODE -ne 0) { throw 'Baseline display probe failed.' }
     $baselineLayouts = Get-ActiveLayouts (Get-Content (Join-Path $out 'physical-baseline.txt') -Raw)
-    if (-not (Get-ArcRiftHeadsetLayoutKey $baselineLayouts $targetId)) { throw 'The headset display saved by Setup is not an active Windows display right now. Check the headset is plugged in (USB and DisplayPort) and awake with the Meta Horizon app open; if you moved it to another port or changed graphics card, run Setup again. No changes made.' }
+    if (-not (Get-ArcRiftHeadsetLayoutKey $baselineLayouts $targetId)) { throw ('The headset display saved by Setup is not an active Windows display right now. Check the headset is plugged in (USB and ' + $headsetProfile.Cable + ') and awake with the Meta Horizon app open; if you moved it to another port or changed graphics card, run Setup again. No changes made.') }
     if ($NativeTiming) {
         $monitor = Get-PnpDevice -InstanceId $monitorInstance -PresentOnly
         if ($monitor.Class -ne 'Monitor') { throw 'Verified headset monitor is missing.' }
         $testEdid = [IO.File]::ReadAllBytes((Join-Path $root 'rift-s-native-test.edid'))
         if ($testEdid.Length -ne 128 -or (($testEdid | Measure-Object -Sum).Sum % 256) -ne 0) { throw 'Invalid native test EDID.' }
-        $pixelClock = ($testEdid[54] + 256 * $testEdid[55]) * 10000
-        $width = $testEdid[56] + (($testEdid[58] -band 240) * 16)
-        $height = $testEdid[59] + (($testEdid[61] -band 240) * 16)
-        if ($width -ne 1440 -or $height -ne 2560 -or $pixelClock -ne 571570000) { throw 'Native EDID differs from the previously tested timing.' }
+        # Release 1.4: the mode is read from the EDID and must be exactly the profile's tested mode (Rift S: 1440x2560,
+        # pixel clock 571570000, as before). $nativeSignal is how display_probe.exe prints that mode once it is live.
+        $nativeMode = Get-ArcRiftEdidMode $testEdid
+        if ($nativeMode.Width -ne $headsetProfile.Width -or $nativeMode.Height -ne $headsetProfile.Height -or $nativeMode.PixelClock -ne $headsetProfile.PixelClock) { throw 'Native EDID differs from the previously tested timing.' }
+        $nativeSize = [string]$nativeMode.Width + 'x' + $nativeMode.Height
+        $nativeSignal = 'signal=' + $nativeSize + ' total=' + $nativeMode.TotalWidth + 'x' + $nativeMode.TotalHeight + ' pixelClock=' + $nativeMode.PixelClock
+        $nativeSignalPattern = [regex]::Escape($nativeSignal)
+        # $useTemporaryEdid: this session applies a temporary Windows EDID override ($registryEdid) to the headset
+        # display. Always for a Rift S. For a Rift CV1 only when Windows does not offer its mode by itself and
+        # "CV1 MODE TEST.cmd" has found a temporary EDID that makes this graphics driver offer it.
+        $useTemporaryEdid = -not $headsetProfile.OwnEdid
+        $registryEdid = $testEdid
+        if ($headsetProfile.OwnEdid) {
+            # Rift CV1 (experimental): no temporary EDID. The session will ask Windows to switch the headset display to
+            # the mode in its own EDID. Everything here only reads and tests, so a graphics card that does not offer
+            # the mode stops the session before anything is changed. (First CV1 report, Arc B580 over HDMI: the
+            # headset ran at 1920x1080 60 Hz, a mode that is not in its EDID at all.)
+            # Windows may round 89.998 Hz down or up and the driver may word the timing differently, so the mode is
+            # confirmed by its size and refresh rate, not by the exact pixel clock.
+            $nativeSignalPattern = 'signal=' + $nativeSize + ' total=\S+ pixelClock=\d+'
+            . (Join-Path $root 'display-mode.ps1')
+            $modeSource = [ArcRiftDisplayMode]::Source($headsetPathId)
+            if (-not $modeSource) { throw ('Windows has not put the ' + $headsetProfile.Name + ' display on a desktop source, so its display mode cannot be switched. No changes made.') }
+            $modeBefore = [ArcRiftDisplayMode]::Current($modeSource)
+            $offeredModes = @([ArcRiftDisplayMode]::Modes($modeSource))
+            $wantedMode = Select-ArcRiftHeadsetMode $offeredModes
+            if (-not $wantedMode) {
+                # Arc cards over HDMI have been reported to show a wrong mode list until the display is detected again.
+                # Restart the headset's monitor device once and look again. Nothing is written anywhere.
+                Write-Output ('Windows does not offer ' + $nativeSize + ' at ' + $headsetProfile.Hz + ' Hz for the headset display. Restarting the headset monitor device once so Windows reads it again...')
+                & pnputil.exe /restart-device $monitorInstance | Out-Null
+                Start-Sleep -Seconds 3
+                $rereadDeadline = (Get-Date).AddSeconds(25)
+                $modeSource = $null
+                while (-not $modeSource -and (Get-Date) -lt $rereadDeadline) { Start-Sleep -Milliseconds 500; $modeSource = [ArcRiftDisplayMode]::Source($headsetPathId) }
+                if ($modeSource) { Start-Sleep -Seconds 3; $modeSource = [ArcRiftDisplayMode]::Source($headsetPathId) }
+                if (-not $modeSource) { throw ('The ' + $headsetProfile.Name + ' display did not come back as a Windows display after its monitor device was restarted. Unplug the headset''s ' + $headsetProfile.Cable + ' cable, plug it back in, then start again.') }
+                $offeredModes = @([ArcRiftDisplayMode]::Modes($modeSource))
+                $wantedMode = Select-ArcRiftHeadsetMode $offeredModes
+            }
+            (@(('Display source: ' + $modeSource), ('Mode before the session (width height hertz): ' + $modeBefore), 'Modes Windows offers for the headset display:') + $offeredModes) | Set-Content -LiteralPath (Join-Path $out 'headset-modes-offered.txt')
+            if ($wantedMode) {
+                $modeSwitch = [pscustomobject]@{ Width = $wantedMode.W; Height = $wantedMode.H; Hz = $wantedMode.Hz; Before = $modeBefore; Needed = ($modeBefore -ne ([string]$wantedMode.W + ' ' + $wantedMode.H + ' ' + $wantedMode.Hz)) }
+                if ($modeSwitch.Needed) {
+                    $modeTest = [ArcRiftDisplayMode]::Set($modeSource, $modeSwitch.Width, $modeSwitch.Height, $modeSwitch.Hz, $true)
+                    if ($modeTest -ne 0) { throw ('Windows lists ' + $nativeSize + ' at ' + $modeSwitch.Hz + ' Hz for the headset display but refused a test of it (result ' + $modeTest + '). No changes made.') }
+                }
+                Write-Output ($headsetProfile.Name + ' (experimental): Windows offers ' + $nativeSize + ' at ' + $modeSwitch.Hz + ' Hz for the headset display' + $(if ($modeSwitch.Needed) { '; the session will switch to it and switch back afterwards.' } else { ' and it is already in use.' }))
+            } else {
+                # The graphics driver leaves the headset's mode out (first seen on an Arc B580 over HDMI). If
+                # "CV1 MODE TEST.cmd" found a temporary EDID that makes the driver offer it, use that, the same way a
+                # Rift S session uses its temporary EDID. Otherwise stop here, before anything is changed.
+                $offeredParsed = @($offeredModes | Where-Object { $_ } | ForEach-Object { $p = $_ -split ' '; [pscustomobject]@{ W = [int]$p[0]; H = [int]$p[1]; Hz = [int]$p[2] } })
+                $sameSize = @($offeredParsed | Where-Object { $_.W -eq $nativeMode.Width -and $_.H -eq $nativeMode.Height } | ForEach-Object { $_.Hz } | Sort-Object -Unique -Descending)
+                $largest = $offeredParsed | Sort-Object { $_.W * $_.H }, Hz -Descending | Select-Object -First 1
+                $found = if ($sameSize.Count) { 'it offers ' + $nativeSize + ' only at ' + ($sameSize -join ', ') + ' Hz' } elseif ($largest) { 'the largest mode it offers is ' + $largest.W + 'x' + $largest.H + ' at ' + $largest.Hz + ' Hz' } else { 'it offers no modes' }
+                $overridePath = Join-Path $root 'cv1-override.edid'
+                if (-not (Test-Path -LiteralPath $overridePath)) {
+                    throw ('Windows does not offer the ' + $headsetProfile.Name + ' display mode (' + $nativeSize + ' at ' + $headsetProfile.Hz + ' Hz) on this graphics card, also after restarting the headset monitor: ' + $found + '. The graphics driver leaves the mode out. Next: run "CV1 MODE TEST.cmd" in the ArcRift folder (about 3 minutes). It tries display-mode variants on the headset display only, puts everything back, and saves one that works for the next session. Then send its cv1-mode-test file. If the headset goes through an adapter, plug its ' + $headsetProfile.Cable + ' cable straight into the card first. No changes made.')
+                }
+                $registryEdid = [byte[]](Get-ArcRiftCv1Override $overridePath $testEdid)
+                $useTemporaryEdid = $true
+                $modeSwitch = [pscustomobject]@{ Width = $nativeMode.Width; Height = $nativeMode.Height; Hz = 0; Before = $modeBefore; Needed = $true }
+                Write-Output ($headsetProfile.Name + ' (experimental): Windows does not offer ' + $nativeSize + ' at ' + $headsetProfile.Hz + ' Hz by itself (' + $found + '). Using the temporary display mode that CV1 MODE TEST found (cv1-override.edid); it is removed again afterwards.')
+            }
+        }
         [IO.File]::WriteAllBytes((Join-Path $out 'original-monitor.edid'), (Get-ItemProperty -LiteralPath $monitorParent -Name EDID).EDID)
-        [IO.File]::WriteAllBytes((Join-Path $out 'temporary-native.edid'), $testEdid)
+        [IO.File]::WriteAllBytes((Join-Path $out 'temporary-native.edid'), $registryEdid)
         @{KeyExisted=$false; Instance=$monitorInstance; Parent=$monitorParent} | Export-Clixml (Join-Path $out 'edid-backup.xml')
     }
     if ($OriginalSteamVRBaselineTrial -or $DashboardNormalUserTrial) {
@@ -510,7 +815,12 @@ try {
     $settings = @(
         @{Path='HKLM:\SOFTWARE\Oculus'; Name='DirectDisplayDLL'; Value=(Join-Path $root $bridgeName); Kind='String'},
         @{Path='HKLM:\SOFTWARE\Oculus'; Name='ForceGPUDriverVersionAcceptance'; Value=1; Kind='DWord'},
-        @{Path='HKLM:\SOFTWARE\WOW6432Node\Oculus VR, LLC\Oculus\Config'; Name='PreventDashLaunch'; Value=$(if ($GuardianSetup) { 0 } else { 1 }); Kind='DWord'}
+        @{Path='HKLM:\SOFTWARE\WOW6432Node\Oculus VR, LLC\Oculus\Config'; Name='PreventDashLaunch'; Value=$(if ($GuardianSetup) { 0 } else { 1 }); Kind='DWord'},
+        # Release 1.4: keep Meta's tracking on while the headset is off. Without it Meta stops tracking about 20 s after
+        # the headset comes off and sits still ("Setting tracking mode to off"), and starting it again on the next
+        # movement is where its runtime crashes (10 of 26 resumes). Meta's own setting: OculusAppFramework.dll reads
+        # this DWORD from this key at start-up, logs "Tracking was forced on by regkey." and then never stops tracking.
+        @{Path='HKLM:\SOFTWARE\WOW6432Node\Oculus VR, LLC\Oculus'; Name='ForceSensorTracking'; Value=1; Kind='DWord'}
     )
     foreach ($s in $settings) {
         $had = $false; $value = $null; $kind = $null
@@ -628,22 +938,71 @@ try {
         # First enumerate the verified output while connected, then change timing.
         # Restarting PnP with the service stopped can hide the display at provider startup.
         & (Join-Path $root 'display_probe.exe') | Out-File -Encoding utf8 (Join-Path $out 'physical-display-before-native.txt')
+        $nativeFirstWait = 6
+        if (-not $useTemporaryEdid) {
+            # Rift CV1 (experimental): switch Windows to the mode in the headset's own EDID. The switch is temporary:
+            # it is not saved, so Windows goes back to its saved mode on restore, after a restart, or when the headset
+            # is unplugged and plugged back in. Meta's runtime was just restarted, so look the display source up again.
+            $modeSource = $null
+            $sourceDeadline = (Get-Date).AddSeconds(20)
+            while ($true) {
+                $modeSource = [ArcRiftDisplayMode]::Source($headsetPathId)
+                if ($modeSource -or (Get-Date) -gt $sourceDeadline) { break }
+                Start-Sleep -Milliseconds 500
+            }
+            if (-not $modeSource) { throw ('The ' + $headsetProfile.Name + ' display is not an active Windows display after Meta''s runtime restarted; refusing render test.') }
+            if ($modeSwitch.Needed) {
+                # headset-mode-switched.txt tells Recover that this session switched the display mode.
+                ('Switched ' + $modeSource + ' from ' + $modeSwitch.Before + ' to ' + $modeSwitch.Width + ' ' + $modeSwitch.Height + ' ' + $modeSwitch.Hz + ' (width height hertz), temporary.') | Set-Content -LiteralPath (Join-Path $out 'headset-mode-switched.txt')
+                $modeChanged = $true
+                $modeResult = [ArcRiftDisplayMode]::Set($modeSource, $modeSwitch.Width, $modeSwitch.Height, $modeSwitch.Hz, $false)
+                if ($modeResult -ne 0) { throw ('Windows refused to switch the headset display to ' + $nativeSize + ' at ' + $modeSwitch.Hz + ' Hz (result ' + $modeResult + ').') }
+                Write-Output ('Headset display switched to its own mode, ' + $nativeSize + ' at ' + $modeSwitch.Hz + ' Hz. Temporary Windows display mode only: no EDID is changed and nothing is written to the headset.')
+            } else { Write-Output ('Headset display is already in its own mode, ' + $nativeSize + ' at ' + $modeSwitch.Hz + ' Hz; nothing to switch.') }
+            $nativeFirstWait = 2
+        } else {
         $edidChanged = $true
         New-Item -Path $edidKey | Out-Null
-        New-ItemProperty -LiteralPath $edidKey -Name '0' -Value $testEdid -PropertyType Binary -Force | Out-Null
-        Write-Output 'Temporary published native timing applied ONLY to verified Rift S monitor. Not a firmware write.'
+        New-ItemProperty -LiteralPath $edidKey -Name '0' -Value $registryEdid -PropertyType Binary -Force | Out-Null
+        Write-Output ('Temporary published native timing applied ONLY to verified ' + $headsetProfile.Name + ' monitor. Not a firmware write.')
         & pnputil.exe /restart-device $monitorInstance
         if ($LASTEXITCODE -ne 0) { throw 'Headset monitor restart failed.' }
+        if ($headsetProfile.OwnEdid) {
+            # Rift CV1 with the temporary EDID from CV1 MODE TEST. Unlike a Rift S, the headset display keeps its
+            # identity, so Windows comes back in the mode it has saved for it (1920x1080): wait for the display,
+            # check that its own mode is offered now, and switch to it. Temporary, as in the branch above.
+            $wantedMode = $null
+            $modeSource = $null
+            $switchDeadline = (Get-Date).AddSeconds(30)
+            Start-Sleep -Seconds 3
+            while ($true) {
+                $modeSource = [ArcRiftDisplayMode]::Source($headsetPathId)
+                if ($modeSource) { Start-Sleep -Seconds 2; $wantedMode = Select-ArcRiftHeadsetMode @([ArcRiftDisplayMode]::Modes($modeSource)) }
+                if ($wantedMode -or (Get-Date) -gt $switchDeadline) { break }
+                Start-Sleep -Milliseconds 500
+            }
+            if (-not $wantedMode) { throw ('With the temporary display mode from CV1 MODE TEST applied, Windows still does not offer ' + $nativeSize + ' at ' + $headsetProfile.Hz + ' Hz. Run "CV1 MODE TEST.cmd" again and send its report.') }
+            $modeSwitch.Hz = $wantedMode.Hz
+            if ([ArcRiftDisplayMode]::Current($modeSource) -ne ([string]$modeSwitch.Width + ' ' + $modeSwitch.Height + ' ' + $modeSwitch.Hz)) {
+                ('Switched ' + $modeSource + ' from ' + $modeSwitch.Before + ' to ' + $modeSwitch.Width + ' ' + $modeSwitch.Height + ' ' + $modeSwitch.Hz + ' (width height hertz), temporary, with the temporary EDID applied.') | Set-Content -LiteralPath (Join-Path $out 'headset-mode-switched.txt')
+                $modeChanged = $true
+                $modeResult = [ArcRiftDisplayMode]::Set($modeSource, $modeSwitch.Width, $modeSwitch.Height, $modeSwitch.Hz, $false)
+                if ($modeResult -ne 0) { throw ('Windows refused to switch the headset display to ' + $nativeSize + ' at ' + $modeSwitch.Hz + ' Hz (result ' + $modeResult + ').') }
+            }
+            Write-Output ('Headset display switched to ' + $nativeSize + ' at ' + $modeSwitch.Hz + ' Hz with the temporary display mode from CV1 MODE TEST.')
+            $nativeFirstWait = 2
+        }
+        } # end of the temporary EDID branch (Rift S always; Rift CV1 with cv1-override.edid)
         # Release 1.2: some PCs (seen on an Arc B580) take longer than 6 s to bring the headset back in its native mode
         # after the monitor restart. Check at 6 s as before, then every 2 s; the last capture is kept.
         # Release 1.3: wait up to 45 s (was 20 s). A PC that is ready sooner continues at once, as before.
         $nativeDeadline = (Get-Date).AddSeconds(45)
-        Start-Sleep -Seconds 6
+        Start-Sleep -Seconds $nativeFirstWait
         $nativeWaitTold = $false
         while ($true) {
             & (Join-Path $root 'display_probe.exe') | Out-File -Encoding utf8 (Join-Path $out 'physical-display-after-runtime-start.txt')
             $probe = Get-Content (Join-Path $out 'physical-display-after-runtime-start.txt') -Raw
-            $match = [regex]::Match($probe, '(?m)^\s*target=' + $targetId + ' [^\r\n]*' + $activePathFlags + '[^\r\n]*\r?\n[^\r\n]*(?i:' + [regex]::Escape($headsetPathId) + ')[^\r\n]*\r?\n\s*signal=1440x2560 total=1752x4078 pixelClock=571570000 vSync=(\d+)/(\d+)')
+            $match = [regex]::Match($probe, '(?m)^\s*target=' + $targetId + ' [^\r\n]*' + $activePathFlags + '[^\r\n]*\r?\n[^\r\n]*(?i:' + [regex]::Escape($headsetPathId) + ')[^\r\n]*\r?\n\s*' + $nativeSignalPattern + ' vSync=(\d+)/(\d+)')
             if ($match.Success -or (Get-Date) -gt $nativeDeadline) { break }
             if (-not $nativeWaitTold) { Write-Output 'Waiting for the headset to come back in its native display mode...'; $nativeWaitTold = $true }
             Start-Sleep -Seconds 2
@@ -651,11 +1010,12 @@ try {
         if (-not $match.Success) {
             $modeReport = Get-ArcRiftHeadsetModeReport $probe $targetId (Test-Path -LiteralPath $edidKey)
             $osNote = if ([Environment]::OSVersion.Version.Build -lt 22000) { ' This PC runs Windows 10; ArcRift is only tested on Windows 11.' } else { '' }
-            throw ('Expected native physical scanout was not confirmed within 45 s after the headset monitor restart; refusing render test. Found: ' + $modeReport + '.' + $osNote)
+            $afterWhat = if ($headsetProfile.OwnEdid) { 'after the display mode switch' } else { 'after the headset monitor restart' }
+            throw ('Expected native physical scanout was not confirmed within 45 s ' + $afterWhat + '; refusing render test. Found: ' + $modeReport + '.' + $osNote)
         }
         $hz = [double]$match.Groups[1].Value / [double]$match.Groups[2].Value
-        if ($hz -lt 79 -or $hz -gt 81) { throw 'Native scanout refresh rate was unexpected.' }
-        Write-Output ('Physical native scanout verified: 1440x2560 at ' + $hz + ' Hz.')
+        if ($hz -lt ($headsetProfile.Hz - 1) -or $hz -gt ($headsetProfile.Hz + 1)) { throw 'Native scanout refresh rate was unexpected.' }
+        Write-Output ('Physical native scanout verified: ' + $nativeSize + ' at ' + $hz + ' Hz.')
     }
     if ($NativeSource) {
         $holdSeconds = 45
@@ -758,9 +1118,14 @@ try {
         if (Test-Path -LiteralPath $steamGraphicsLog) { $steamGraphicsOffset = (Get-Item -LiteralPath $steamGraphicsLog).Length }
         if ($UserLaunchSteamTrial) {
             if ($DashboardNormalUserTrial) {
-                $client = Start-ArcRiftSteamWorker -EvidenceDirectory $out -WaitForCompositor -MetaServerPid $serverId -SourceHelperPid $sourceHelper.Id
+                # Release 1.4: a manual session no longer fails its launch on a few SteamVR sync timeouts while starting
+                # (one on the very first frame stopped two sessions on 2026-11-15, with SteamVR render resolution at 150 %).
+                $client = Start-ArcRiftSteamWorker -EvidenceDirectory $out -WaitForCompositor -MetaServerPid $serverId -SourceHelperPid $sourceHelper.Id -TolerateSyncTimeouts:$ManualSession
                 $bootstrapServerId = $script:ArcRiftSteamWorkerStartupState.BootstrapServerId
                 $bootstrapCompositorId = $script:ArcRiftSteamWorkerStartupState.BootstrapCompositorId
+                if ([int]$script:ArcRiftSteamWorkerStartupState.BootstrapSyncTimeouts -gt 0) {
+                    Write-Output ('SteamVR logged ' + [int]$script:ArcRiftSteamWorkerStartupState.BootstrapSyncTimeouts + ' sync timeout line(s) while starting; continuing. Frame-rate, freeze and device-loss guards stay active.')
+                }
             } else {
                 $client = Start-ArcRiftSteamWorker -EvidenceDirectory $out
             }
@@ -930,14 +1295,37 @@ try {
                         if ($metaLogPath) { $metaLogOffset = 0L } else { $metaLogOffset = $metaLogNow.Length }
                         $metaLogPath = $metaLogNow.FullName
                         $metaLastGrowth = Get-Date
+                        if (-not $trackingForcedChecked) {
+                            # 1.4: Meta logs this once at start-up when it has read ForceSensorTracking. Never fails the session.
+                            $trackingForcedChecked = $true
+                            try {
+                                [long]$metaLogFromStart = 0
+                                if ((Read-AppendedBridgeLog $metaLogPath ([ref]$metaLogFromStart)) -match 'Tracking was forced on by regkey') {
+                                    Write-Output 'Tracking stays on while the headset is off (Meta setting ForceSensorTracking), so taking it off or putting it down no longer makes Meta pause tracking.'
+                                } else {
+                                    Write-Output 'Note: Meta''s runtime did not confirm the keep-tracking-on setting (ForceSensorTracking). Putting the headset down for a while may still crash it.'
+                                }
+                            } catch { Write-Output ('Keep-tracking-on check note (session unaffected): ' + $_.Exception.Message) }
+                        }
                     }
+                }
+                # Meta crash watchdog (1.4): a new report in Meta's own crash folder means its runtime crashed. Seen
+                # within 2 s, instead of after 30 s of log silence.
+                if ((Get-Date) -ge $metaCrashCheckAt) {
+                    $metaCrashCheckAt = (Get-Date).AddSeconds(2)
+                    $metaCrashes = @(Get-ArcRiftNewMetaCrash)
+                    if ($metaCrashes.Count) { $metaCrashAt = Get-Date; Save-ArcRiftMetaCrashRecord $metaCrashes; throw 'Meta runtime crashed (Meta wrote a crash report; see meta-crash.txt); stopping and restoring so a fresh session can be started.' }
                 }
                 if ($metaLogPath) {
                     $metaNew = Read-AppendedBridgeLog $metaLogPath ([ref]$metaLogOffset)
                     # v5 freeze watchdog: Meta logs at least every ~15 s even when idle (longest normal gap seen: 13.5 s).
-                    # Its runtime can hang when it restarts tracking after the headset sat still; then its log stops.
+                    # Every stop of this kind checked so far was a crash (above); this stays as the fallback for a real hang.
                     if ($metaNew.Length -gt 0) { $metaLastGrowth = Get-Date }
-                    elseif (((Get-Date) - $metaLastGrowth).TotalSeconds -gt 30) { throw 'Meta runtime stopped responding (its log was silent for 30 s); stopping and restoring so a fresh session can be started.' }
+                    elseif (((Get-Date) - $metaLastGrowth).TotalSeconds -gt 30) {
+                        $metaCrashes = @(Get-ArcRiftNewMetaCrash)
+                        if ($metaCrashes.Count) { $metaCrashAt = Get-Date; Save-ArcRiftMetaCrashRecord $metaCrashes; throw 'Meta runtime crashed (Meta wrote a crash report; see meta-crash.txt); stopping and restoring so a fresh session can be started.' }
+                        Save-ArcRiftMetaHangRecord; throw 'Meta runtime stopped responding (its log was silent for 30 s); stopping and restoring so a fresh session can be started.'
+                    }
                     foreach ($metaLine in ($metaNew -split "`r?`n")) {
                         if ($metaLine -match 'Proximity state changed \(1 -> 0\)|Broadcasting HMD unmounted event') {
                             if (-not $headsetOff) {
@@ -951,6 +1339,13 @@ try {
                                 $candidateLastHealth = Get-Date; $bridgeFpsPrevTick = $null; $bridgeLowFpsCount = 0
                                 Write-Output 'Headset on: freeze check resumes after a 24-second grace period.'
                                 ('At ' + (Get-Date).ToString('o') + ': headset on, freeze check resumes') | Add-Content (Join-Path $out 'sync-hiccups.txt')
+                            }
+                        } elseif ($metaLine -match 'Setting tracking mode to off') {
+                            # 1.4: should not happen with ForceSensorTracking. Record it, so a crash that follows can be tied to it.
+                            ('At ' + (Get-Date).ToString('o') + ': Meta paused tracking although ForceSensorTracking is set') | Add-Content (Join-Path $out 'sync-hiccups.txt')
+                            if (-not $trackingPauseWarned) {
+                                $trackingPauseWarned = $true
+                                Write-Output 'Note: Meta paused tracking although ForceSensorTracking is set. Picking the headset up may crash Meta''s runtime; the session then restores and restarts by itself.'
                             }
                         }
                     }
@@ -1248,6 +1643,32 @@ public static class ArcRiftGpuPriority {
                 Write-Output 'Original absent EDID override restored; monitor restarted.'
             } catch { $failed = $true; Write-Output ('EDID RESTORE ERROR: ' + $_.Exception.Message) }
         }
+        if ($modeChanged) {
+            # Rift CV1 (experimental): put the headset display back in the mode Windows has saved for it. If Windows
+            # does not go back by itself, set the mode from before the session; last, restart the monitor device, which
+            # is what brings a Rift S back. The check against the baseline below decides whether it worked.
+            try {
+                $restoreSource = [ArcRiftDisplayMode]::Source($headsetPathId)
+                if ($restoreSource) {
+                    $restoreResult = [ArcRiftDisplayMode]::Restore($restoreSource)
+                    Start-Sleep -Seconds 3
+                    $modeNow = [ArcRiftDisplayMode]::Current($restoreSource)
+                    $beforeParts = @($modeSwitch.Before -split ' ')
+                    if ($modeNow -ne $modeSwitch.Before -and $beforeParts.Count -eq 3) {
+                        $restoreResult = [ArcRiftDisplayMode]::Set($restoreSource, [int]$beforeParts[0], [int]$beforeParts[1], [int]$beforeParts[2], $false)
+                        Start-Sleep -Seconds 3
+                        $modeNow = [ArcRiftDisplayMode]::Current($restoreSource)
+                    }
+                    if ($modeNow -ne $modeSwitch.Before) {
+                        Write-Output ('Headset display is still at ' + $modeNow + ' (result ' + $restoreResult + '); restarting its monitor device.')
+                        & pnputil.exe /restart-device $monitorInstance
+                        Start-Sleep -Seconds 3
+                    }
+                    Write-Output ('Headset display mode put back (was ' + $modeSwitch.Before + ' before the session, width height hertz).')
+                } else { Write-Output 'The headset display is not active right now; Windows uses its saved mode when it comes back (the session''s mode was never saved).' }
+                & (Join-Path $root 'display_probe.exe') | Out-File -Encoding utf8 (Join-Path $out 'physical-display-after-rollback.txt')
+            } catch { $failed = $true; Write-Output ('DISPLAY MODE RESTORE ERROR: ' + $_.Exception.Message) }
+        }
         Start-Service OVRService -ErrorAction Continue
         try {
             $restored = $false
@@ -1285,6 +1706,16 @@ public static class ArcRiftGpuPriority {
         $sessionLock.Dispose()
         Remove-Item -LiteralPath $sessionLockPath -ErrorAction Continue
     }
+    # Release 1.4: after the known headset-down Meta crash, start a fresh session by itself (the folder lock and
+    # marker are released above). Never after Stop & restore, an unverified restore, or three restarts in a row.
+    try {
+        $readyItem = Get-Item -LiteralPath (Join-Path $out 'session-ready.txt') -ErrorAction SilentlyContinue
+        $restartDecision = Get-ArcRiftAutoRestartDecision -Manual $ManualSession.IsPresent -Guardian $GuardianSetup.IsPresent -CrashAt $metaCrashAt `
+            -RollbackVerified $rollbackVerified -StopRequested ($userStopRequested -or (Test-Path -LiteralPath (Join-Path $out 'session-stop.txt'))) `
+            -ReadyAt $(if ($readyItem) { $readyItem.LastWriteTime } else { $null }) -Count $AutoRestartCount
+        if ($restartDecision -eq '') { Start-ArcRiftAutoRestart }
+        elseif ($restartDecision) { Write-Output $restartDecision }
+    } catch { Write-Output ('Automatic restart not started: ' + $_.Exception.Message + ' Start a new session from ArcRift Control.') }
     Stop-Transcript
 }
 if ($failed) { exit 1 }

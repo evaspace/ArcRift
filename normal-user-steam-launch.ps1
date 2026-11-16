@@ -2,7 +2,7 @@
 . (Join-Path $PSScriptRoot 'normal-user-launch.ps1')
 function Start-ArcRiftSteamWorker {
     param([Parameter(Mandatory=$true)][string]$EvidenceDirectory, [switch]$ProbeOnly,
-          [switch]$WaitForCompositor, [int]$MetaServerPid=0, [int]$SourceHelperPid=0)
+          [switch]$WaitForCompositor, [int]$MetaServerPid=0, [int]$SourceHelperPid=0, [switch]$TolerateSyncTimeouts)
     $nonce = [guid]::NewGuid().ToString()
     foreach ($name in @('user-worker-ready.json','user-worker-started.json','user-worker-error.json','user-worker-go.txt')) {
         if (Test-Path -LiteralPath (Join-Path $EvidenceDirectory $name)) { throw 'Worker evidence directory is not fresh.' }
@@ -12,6 +12,7 @@ function Start-ArcRiftSteamWorker {
     $scriptText = "& '$worker' -EvidenceDirectory '$dirLiteral' -Nonce '$nonce'"
     if ($ProbeOnly) { $scriptText += ' -ProbeOnly' }
     if ($WaitForCompositor) { $scriptText += (' -WaitForCompositor -MetaServerPid ' + $MetaServerPid + ' -SourceHelperPid ' + $SourceHelperPid) }
+    if ($TolerateSyncTimeouts) { $scriptText += ' -TolerateSyncTimeouts' }
     Start-ArcRiftNormalUserPowerShell -ScriptText $scriptText
     $readyPath = Join-Path $EvidenceDirectory 'user-worker-ready.json'
     $errorPath = Join-Path $EvidenceDirectory 'user-worker-error.json'

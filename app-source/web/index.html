@@ -183,6 +183,15 @@
       </div>
       <div class="msg" id="wizMsg"></div>
     </div>
+    <div class="card wizard" style="margin-top:16px">
+      <h2>Compatibility report</h2>
+      <p>For testers of other Intel Arc cards and other headsets. <b>Check my PC</b> only reads: it changes nothing and starts no session. It writes a <code>compat-report-…txt</code> file in the ArcRift folder with your graphics card and driver, how Windows presents the headset display, and what Meta's runtime says about the headset. Serial numbers are masked; please still read the file before posting it publicly.</p>
+      <p>Before you press it: headset plugged in (USB and display cable into the Arc card), Meta Horizon app open, and the headset worn for a few seconds so it is awake.</p>
+      <div class="btns" style="grid-template-columns: auto; justify-content: start;">
+        <button class="act ghost" id="btnReport">Check my PC</button>
+      </div>
+      <div class="msg" id="reportMsg" style="white-space:pre-wrap"></div>
+    </div>
   </section>
 
   <section id="tab-help" class="hidden">
@@ -472,6 +481,16 @@ $('wizNext').onclick = async () => {
   showMsg($('wizMsg'), `Recorded ${r.count} devices.`);
   if (r.result) wizResult = r.result;
   wizStep++; wizRender();
+};
+$('btnReport').onclick = async () => {
+  const b = $('btnReport');
+  b.disabled = true;
+  $('reportMsg').className = 'msg show'; $('reportMsg').innerHTML = '<span class="spinner"></span>Reading… this takes about half a minute.';
+  let r;
+  try { r = await call('/api/compat-report'); }
+  catch (e) { r = { ok: false, message: 'ArcRift Control did not answer. Close this window and open ArcRift Control again.' }; }
+  b.disabled = false;
+  showMsg($('reportMsg'), r.message || 'Done.', r.ok === false);
 };
 $('wizRestart').onclick = () => { wizStep = 0; wizResult = null; $('wizMsg').className = 'msg'; wizRender(); };
 wizRender();

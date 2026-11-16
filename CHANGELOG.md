@@ -191,7 +191,7 @@ cable goes straight into the B580's HDMI port with no adapter, so an adapter's 1
 ### Other Intel Arc cards
 - The app knows the A380, A580, A750, A770, B570 and B580 by device ID and says what is known about each one
   (only the A770 is tested). Setup has a **Check my PC** button that writes the compatibility report.
-  *In `app-source`; `ArcRift Control.exe` has not been rebuilt with it yet.*
+  `ArcRift Control.exe` was rebuilt with it for 1.5 (2026-11-15).
 - Experimental, **not used by a session yet**: `source/arcrift_igcl_edid.cpp`, a helper that replaces the headset
   output's EDID through Intel's own driver library instead of Windows' EDID override. It is meant as a fallback
   for the B580 report, where Windows' override was not picked up. It is not in `BUILD-RELEASE.cmd` or the

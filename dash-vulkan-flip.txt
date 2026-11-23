@@ -1,0 +1,2 @@
+Opt-in experiment: while this file exists, arc_rift_bridge.dll patches Meta's IsGPUDashVulkanCapable check in
+OVRServer memory so Dash is told the Arc can run Vulkan. Delete this file to turn it off. See CHANGELOG.md.

@@ -1,5 +1,125 @@
 # Changelog
 
+## 1.6 (2026-11-22)
+
+### Meta Dash & Guardian enabled out of the box
+- Ships with `dash-vulkan-flip.txt`, `dash-vulkan-semaphore-fix.txt`, and `vk-layer\arcrift_vk_layer.dll` enabled (without the heavy validation-layer trace file).
+- Fixed Vulkan layer handle/device leaks by hooking `vkDestroyImage` and `vkDestroyDevice` (allowing clean Vulkan device recreation) and fixed uninitialized output handle / memory-type fallback edge cases in `AllocateMemory`.
+- Made `ApplyDashVulkanFlip` fall back to a unique 27-byte executable-section signature scan if a Meta Horizon update shifts RVA `0x166f17`.
+- `-GuardianSetup` / Meta Dash sessions no longer require Steam or SteamVR, now include the Meta Breakpad crash watchdog, 30 s freeze watchdog, `ForceSensorTracking` check, proximity-off pause, and `OVRServer_x64`/`OculusDash` GPU+CPU priority boost, and no longer false-trigger "Guardian saved" on startup when an existing Guardian loads.
+- Added `START META DASH.cmd` shortcut.
+
+### Redesigned ArcRift Control UI & DPI scaling fix
+- Two switchable built-in UI themes in the top bar: **Arc Glass** (sidebar layout) and **Studio Minimal** (compact top command bar + wide console).
+- Viewport-fitted (`100vh`) responsive layout and `1120x700` default window size so the UI scales cleanly at 100%–150% Windows DPI without clipping the session log.
+- Made **Start Meta Dash / Guardian** the primary button, kept **Start VR session (SteamVR)** as secondary, and removed the legacy Room Boundary panel.
+- Setup now saves `headsetProfile` (`rift-s` / `rift-cv1`) and does not require a scraped USB serial for Rift CV1.
+
+### Bridge performance & reliability
+- Switched swapchain to `DXGI_SWAP_EFFECT_FLIP_DISCARD`, `DXGI_SCALING_NONE` on 1:1 native surfaces, and 1-frame waitable latency (`DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT` + `SetMaximumFrameLatency(1)`).
+- Replaced per-frame `ReadProcessMemory` syscall in `Display::Present` with zero-syscall x64 SEH pointer read.
+- Wrapped bridge window creation in Per-Monitor DPI Awareness v2 (`WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT`).
+- Made `Trace()` mutex-guarded with shared file open (`_SH_DENYNO`) to eliminate dropped log lines.
+- Hid `native_source_session.exe`'s console window (`-WindowStyle Hidden`) and skipped redundant source-only emergency restore during EDID/mode rollback.
+
+### Intel Arc B580 & Rift CV1 support
+- Built and integrated `arcrift_igcl_edid.exe` (Intel driver-level IGCL EDID override with 128/256-byte EDID and `CTL_MAKE_VERSION(1, 0)` fallback) as an automatic fallback when Windows `EDID_OVERRIDE` restarts are ignored (e.g., on Arc B580), with full rollback & recovery `--undo` support.
+- Added 256-byte EDID support across `edid_mode.h`, `test-ovr-d3d11.ps1`, `recover-manual-session.ps1`, and `cv1-mode-probe.ps1`.
+- Added 256-byte CTA-861 HDMI VSDB (`340 MHz` / `300 MHz` Max TMDS Clock) variants and IGCL fallback to `CV1 MODE TEST.cmd` to address the 165 MHz TMDS cap on strict HDMI 2.0/2.1 drivers.
+- Fixed `Get-ArcRiftCv1Override` serial descriptor detection (dynamically locates `0xFF` instead of hardcoding bytes `90..107`).
+
+## Unreleased: Dash Vulkan whitelist experiment (2026-11-22)
+
+- Meta's runtime (208.0.0.84.535) decides from a hard-coded list, `IsGPUDashVulkanCapable` in `OVRServer_x64.exe`,
+  which GPUs can run Dash on Vulkan: listed AMD (`0x1002`) and NVIDIA (`0x10de`) device IDs only. Intel is always
+  "incapable" without Vulkan being tried, which is where the A770's `"VulkanCapable": false` comes from.
+- Guardian setup session of 22 Nov 15:07 with the unchanged bridge: Meta's compositor worked (both 1440x2560 surfaces
+  created, first frame presented), Dash loaded its Home UI and then quit while creating its own Vulkan eye swapchain
+  ("Failed to configure Rendering Code: -4"), four times in 5 s. Dash logs nothing before that line.
+- New, opt-in: when `dash-vulkan-flip.txt` exists next to `arc_rift_bridge.dll`, the bridge (which runs inside
+  OVRServer) patches that one check in OVRServer's memory to answer "capable" (RVA 0x166f1f, `xor r13b,r13b` ->
+  `mov r13b,1`). No Meta file is changed. It is applied only when 27 bytes around that spot match runtime
+  208.0.0.84.535 exactly (checked unique in the file), so after a Meta update it logs that it was skipped.
+  The bridge log says whether it was applied. Without the file the bridge behaves exactly as before.
+- Only `arc_rift_bridge.dll` was rebuilt (same compiler line as BUILD-RELEASE.cmd) and `release-manifest.json`
+  rewritten; the other five programs are unchanged. The previous DLL, manifest and source are in
+  `backup-before-dash-vulkan-flip\`.
+- Checked here: the 27 bytes match OVRServer on disk and occur once; `bridge_selftest.exe` passes with and without
+  the file and refuses to patch outside OVRServer.
+- Guardian setup session of 22 Nov 15:16 with the flip: the bridge log says it patched, Meta's hardware report now
+  says `"VulkanCapable": true`, and Meta's hardware blocker went from `systemHardware` to `nothing` (the Meta app's
+  message changed). Dash still quit with the same -4 each launch, so the headset only flashed: every launch started
+  the compositor, which presented frames for 0.4-2 s and shut down when Dash quit. So the whitelist was one blocker,
+  and Dash's own Vulkan setup is another.
+
+### Dash Vulkan trace (opt-in, needs the Vulkan SDK)
+- When `dash-vulkan-trace.txt` exists next to the bridge, the bridge sets the Vulkan SDK's API-dump and validation
+  layers in OVRServer's own environment. Dash is started by OVRServer and inherits it, so only Meta's processes are
+  traced: no system-wide or registry changes. Logs go to `vulkan-trace\`, one `-apidump.txt` and one
+  `-validation.txt` per launch (the bridge renames them every 250 ms because Meta starts Dash several times).
+- The layers are found in the Vulkan loader's registered explicit layers or in `%VULKAN_SDK%\Bin`. Without the SDK
+  the bridge log says "Vulkan SDK layers not found" and nothing is enabled.
+- Checked here: builds without new warnings, `bridge_selftest.exe` passes and refuses to enable it outside OVRServer.
+- Guardian setup session of 22 Nov 15:29 (Vulkan SDK 1.4.363.1): Dash inherited it (five launches, one API dump and
+  one validation log each). Every Vulkan call returned VK_SUCCESS. The validation layer, and Dash itself, logged
+  `vkCreateSemaphore(): ... handleTypes (VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT) does not support
+  VK_EXTERNAL_SEMAPHORE_FEATURE_EXPORTABLE_BIT`, and Dash quit with -4 34 ms later.
+
+### Cause of Dash's "-4" on Intel Arc, and an opt-in fix
+- The semaphore comes from Meta's runtime library inside Dash (`LibOVRRTImpl64_1.dll`), building its "SyncContext"
+  with the compositor. It exports a KMT (old global) handle whenever the device lists
+  `VK_KHR_external_semaphore_win32`; it never asks whether KMT export works. The Arc driver lists the extension but
+  supports NT handles only. `tools\vk_layer_test` shows it on this A770 (driver 0x001963d7): semaphore NT
+  exportable=1, KMT exportable=0. NVIDIA and AMD drivers export KMT, which is why this only fails on Arc.
+- When the extension is not listed, the same library logs "[Non-fatal] VK_KHR_external_semaphore_win32 not supported,
+  using fallback notification synchronization" and carries on.
+- New: `vk-layer\arcrift_vk_layer.dll` (`source\arcrift_vk_layer.cpp`), a Vulkan layer that hides only that extension,
+  and only after the process has created its Vulkan device: Dash enables the extension when it creates its device,
+  and the Vulkan loader refuses a device whose extensions are not listed (seen in the test: -7 when hidden from the
+  start). With `dash-vulkan-semaphore-fix.txt` next to the bridge, the bridge enables it (same way as the trace) for
+  processes OVRServer starts.
+- Checked here with `tools\vk_layer_test`: without the layer 160 extensions and the device is created; with it (and
+  the validation layer) the device with Dash's extensions is still created, and the list read afterwards has 159,
+  without that extension. The bridge self-test passes. **Not yet checked in a real session:** whether Dash then runs.
+- Guardian setup session of 22 Nov 15:40 with the layer: it loaded in every Dash launch and hid the extension after
+  Dash's device existed (`vk-layer\arcrift-vk-layer.log`). The KMT semaphore is gone (no `vkCreateSemaphore` in the
+  API dump). Dash still quit with -4, now on the first failing Vulkan call of all these runs:
+  `vkImportFenceWin32HandleKHR(handleType OPAQUE_WIN32, handle from Meta's compositor)` returns
+  `VK_ERROR_INVALID_EXTERNAL_HANDLE`. Meta's fallback imports the compositor's D3D-side sync object into Vulkan as a
+  fence; the Arc driver can import such objects only as semaphores (`D3D12_FENCE` importable=1 in the test).
+- So both of Meta's Vulkan<->D3D11 sync routes for Dash rely on handle types the Arc driver does not support.
+- That fence import has the same kind of guard: when the device does not list `VK_KHR_external_fence_win32`, Meta's
+  library logs "[Non-fatal] VK_KHR_external_fence_win32 not supported, using fallback synchronization" and skips it.
+  The layer now hides that extension too, the same way (after the device exists). The list can be overridden with
+  `ARCRIFT_VK_HIDE_EXTENSIONS` (';'-separated). Checked with `tools\vk_layer_test`: device with Dash's extensions
+  still created, the list afterwards has 158 (both hidden), validation layer quiet. If Meta's own fallback also fails,
+  the next step is emulating the sync object in the layer.
+- **First time Dash ran on Intel Arc:** Guardian setup session of 22 Nov 15:46 with flip + both hidden extensions.
+  Dash started once at 15:47:07 and ran for over 5 minutes: Meta's Guardian setup worked through the headset
+  cameras (passthrough texture set created 15:48:42, `inside_out_guardian_setup` events) and Meta saved a
+  `walls_and_floor` Guardian. Meta's fallback synchronization works.
+- New failure: at 15:52:19 Dash crashed (`STATUS_ACCESS_VIOLATION`) right after
+  `vkBindImageMemory(): memory is VK_NULL_HANDLE`. The memory came from a failed import of a shared D3D11 texture:
+  `vkAllocateMemory(): ... memoryTypeBits is 0x0 with handleType VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_KMT_BIT`.
+  The Arc driver cannot import old KMT-shared D3D11 textures. One such import already failed harmlessly at Dash's
+  start; the one at 15:52 was bound and crashed it. In the next session (15:54) Dash crashed the same way 7 s after
+  starting. Next step, not started: make those KMT texture imports work in the layer.
+- Cause found and fixed in the layer: the swapchain textures Dash imports (3296x1776 colour + depth, 4x4 colour) come
+  in as KMT D3D11 handles. `tools\vk_layer_test\kmt_import_test.cpp` reproduces it on the A770 without Meta: the KMT
+  import works for RGBA8 colour and D32 depth, but for D24S8 depth `vkAllocateMemory` returns VK_SUCCESS with a NULL
+  memory (both crashing runs ended on a D24S8 import). The layer now gives such an image ordinary device-local
+  memory instead and logs "import of image ... gave it local memory instead" in `vk-layer\arcrift-vk-layer.log`.
+  Meta's compositor then does not see that depth buffer (only used for ASW/positional timewarp, off on Arc).
+  Checked with the test: with the layer all three formats get memory and bind; the extension test still passes.
+- The trace now enables only the validation layer. The API dump (6.4 GB for the 5-minute run) needs its own opt-in
+  file, `dash-vulkan-apidump.txt`. Bridge rebuilt, manifest rewritten (only the bridge changed), self-test passes.
+- `[OVRServer] Set Oculus as Active OpenXR Runtime` is logged at every Meta start, including the 15:46 session where
+  Dash ran for 5 minutes, so the OpenXR runtime setting is not what crashed Dash. It is a system-wide setting the
+  session does not restore: SteamVR games that use OpenXR now go to Meta's runtime.
+- The layer is built separately (it needs the Vulkan SDK's headers) and is not in `release-manifest.json`; the
+  session does not verify it. The layer and test were built with:
+  `cl /EHsc /std:c++17 /W4 /O2 /MT /LD /I"%VULKAN_SDK%\Include" arcrift_vk_layer.cpp /Fe:..\vk-layer\arcrift_vk_layer.dll`.
+
 ## 1.5 (2026-11-15)
 
 This release includes all the 1.4 work below (1.4 was only shared as test builds, never published here; comments marked "Release 1.4" in

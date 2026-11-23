@@ -90,9 +90,17 @@ try {
     $key='HKLM:\SYSTEM\CurrentControlSet\Enum\'+$edid.Instance+'\Device Parameters\EDID_OVERRIDE'
     if (Test-Path $key) {
         $item=Get-Item $key
-        if (@($item.GetValueNames() | Where-Object { $_ -ne '0' }).Count -or $item.SubKeyCount) { throw 'Unexpected EDID values; refusing to discard them.' }
+        if (@($item.GetValueNames() | Where-Object { $_ -notin '0','1' }).Count -or $item.SubKeyCount) { throw 'Unexpected EDID values; refusing to discard them.' }
         Remove-ItemProperty $key -Name '0' -ErrorAction SilentlyContinue
+        Remove-ItemProperty $key -Name '1' -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath $key
+    }
+    if (Test-Path -LiteralPath (Join-Path $full 'igcl-edid-override.txt')) {
+        $igclExe = Join-Path $root 'arcrift_igcl_edid.exe'
+        if (Test-Path -LiteralPath $igclExe) {
+            try { & $igclExe --undo | Out-Null; Write-Output 'Intel driver-level EDID override (IGCL) removed.' }
+            catch { Write-Output ('IGCL EDID undo note: ' + $_.Exception.Message) }
+        }
     }
     # v3: start Meta's runtime first; the Rift S display only appears while it runs. Then retry the restart.
     Start-Service OVRService

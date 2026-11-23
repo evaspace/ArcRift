@@ -85,16 +85,41 @@ static bool WindowsHeadsetAdapter(const ArcRiftIdentity& id, LUID& luid) {
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     enum { Status, Override, Undo } op;
-    if (argc == 2 && !strcmp(argv[1], "--status")) op = Status;
-    else if (argc == 2 && !strcmp(argv[1], "--override")) op = Override;
-    else if (argc == 2 && !strcmp(argv[1], "--undo")) op = Undo;
-    else { puts("Usage: arcrift_igcl_edid --status | --override | --undo"); return 2; }
+    const char* edidArg = nullptr;
+    bool replaceExisting = false;
+    if (argc >= 2 && !strcmp(argv[1], "--status") && argc == 2) op = Status;
+    else if (argc >= 2 && !strcmp(argv[1], "--undo") && argc == 2) op = Undo;
+    else if (argc >= 2 && !strcmp(argv[1], "--override")) {
+        op = Override;
+        for (int i = 2; i < argc; ++i) {
+            if (!strcmp(argv[i], "--edid") && i + 1 < argc) { edidArg = argv[++i]; }
+            else if (!strcmp(argv[i], "--replace")) { replaceExisting = true; }
+            else { puts("Usage: arcrift_igcl_edid --status | --override [--edid <path>] [--replace] | --undo"); return 2; }
+        }
+    } else {
+        puts("Usage: arcrift_igcl_edid --status | --override [--edid <path>] [--replace] | --undo");
+        return 2;
+    }
     const char* opName = op == Status ? "status" : op == Override ? "override" : "undo";
 
     const ArcRiftIdentity id = ArcRiftLoadIdentity(nullptr);
     if (!id.valid) { printf("RESULT op=%s ok=0 reason=identity-missing (run Setup; arcrift-identity.txt not found or incomplete)\n", opName); return 1; }
     char sessionEdid[256]{};
-    if (op == Override && !ArcRiftReadSessionEdid(nullptr, sessionEdid)) { printf("RESULT op=%s ok=0 reason=session-edid-missing-or-invalid\n", opName); return 1; }
+    size_t sessionEdidSize = 0;
+    if (op == Override) {
+        bool readOk = false;
+        if (edidArg) {
+            wchar_t widePath[MAX_PATH]{};
+            if (MultiByteToWideChar(CP_UTF8, 0, edidArg, -1, widePath, MAX_PATH) > 0)
+                readOk = ArcRiftReadEdidFile(widePath, sessionEdid, &sessionEdidSize);
+        } else {
+            readOk = ArcRiftReadSessionEdid(nullptr, sessionEdid, &sessionEdidSize);
+        }
+        if (!readOk || (sessionEdidSize != 128 && sessionEdidSize != 256)) {
+            printf("RESULT op=%s ok=0 reason=session-edid-missing-or-invalid\n", opName);
+            return 1;
+        }
+    }
     LUID windowsLuid{};
     const bool windowsActive = WindowsHeadsetAdapter(id, windowsLuid);
     if (op == Override && !windowsActive) { printf("RESULT op=%s ok=0 reason=headset-not-an-active-windows-display\n", opName); return 1; }
@@ -119,6 +144,12 @@ int main(int argc, char** argv) {
     init.AppVersion = CTL_IMPL_VERSION;
     ctl_api_handle_t api = nullptr;
     ctl_result_t result = p_ctlInit(&init, &api);
+    if (result == CTL_RESULT_ERROR_UNSUPPORTED_VERSION) {
+        init = {};
+        init.Size = sizeof(init);
+        init.AppVersion = CTL_MAKE_VERSION(1, 0);
+        result = p_ctlInit(&init, &api);
+    }
     if (result != CTL_RESULT_SUCCESS) { printf("RESULT op=%s ok=0 reason=intel-control-library-init-failed result=%08x\n", opName, unsigned(result)); return 3; }
 
     // Find the headset output: an allowed Intel card (and, when Windows shows the headset, exactly that card),
@@ -177,17 +208,24 @@ int main(int argc, char** argv) {
             const bool supportedType = headsetProps.Type == CTL_DISPLAY_OUTPUT_TYPES_DISPLAYPORT || headsetProps.Type == CTL_DISPLAY_OUTPUT_TYPES_HDMI;
             if (!supportedType) printf("RESULT op=override ok=0 reason=output-type-not-supported type=%d\n", int(headsetProps.Type));
             else if (!(headsetProps.DisplayConfigFlags & CTL_DISPLAY_CONFIG_FLAG_DISPLAY_ATTACHED)) puts("RESULT op=override ok=0 reason=headset-not-attached");
-            else if (overridden && current.data.size() == 128 && memcmp(current.data.data(), sessionEdid, 128) == 0) { puts("RESULT op=override ok=1 already=1"); exitCode = 0; }
-            else if (overridden) puts("RESULT op=override ok=0 reason=another-override-is-active (run --undo first)");
+            else if (overridden && current.data.size() == sessionEdidSize && memcmp(current.data.data(), sessionEdid, sessionEdidSize) == 0) { puts("RESULT op=override ok=1 already=1"); exitCode = 0; }
+            else if (overridden && !replaceExisting) puts("RESULT op=override ok=0 reason=another-override-is-active (run --undo first)");
             else {
+                if (overridden && replaceExisting) {
+                    ctl_edid_management_args_t u{};
+                    u.Size = sizeof(u);
+                    u.OpType = CTL_EDID_MANAGEMENT_OPTYPE_UNDO_OVERRIDE_EDID;
+                    u.EdidType = CTL_EDID_TYPE_OVERRIDE;
+                    (void)pEdid(headset, &u);
+                }
                 ctl_edid_management_args_t a{};
                 a.Size = sizeof(a);
                 a.OpType = CTL_EDID_MANAGEMENT_OPTYPE_OVERRIDE_EDID;
                 a.EdidType = CTL_EDID_TYPE_OVERRIDE;
-                a.EdidSize = 128;
+                a.EdidSize = static_cast<uint32_t>(sessionEdidSize);
                 a.pEdidBuf = reinterpret_cast<uint8_t*>(sessionEdid);
                 result = pEdid(headset, &a);
-                printf("RESULT op=override ok=%d result=%08x flags=%x windowsNotified=%d\n", result == CTL_RESULT_SUCCESS, unsigned(result), unsigned(a.OutFlags),
+                printf("RESULT op=override ok=%d bytes=%zu result=%08x flags=%x windowsNotified=%d\n", result == CTL_RESULT_SUCCESS, sessionEdidSize, unsigned(result), unsigned(a.OutFlags),
                     !!(a.OutFlags & CTL_EDID_MANAGEMENT_OUT_FLAG_OS_CONN_NOTIFICATION));
                 exitCode = result == CTL_RESULT_SUCCESS ? 0 : 1;
             }

@@ -35,22 +35,37 @@ inline ArcRiftEdidMode ArcRiftParseEdidMode(const unsigned char* e) {
     return m;
 }
 
-// Reads the session's EDID file from the folder of "module" (nullptr = this program) into a 256-byte buffer: the
-// first 128 bytes are the EDID, the rest is zero. Fails unless it is a complete, checksummed Oculus (OVR) EDID.
-inline bool ArcRiftReadSessionEdid(HMODULE module, char* output256) {
+// Reads the session's EDID file from the folder of "module" (nullptr = this program) into a 256-byte buffer:
+// supports 128-byte base EDIDs (Rift S; trailing 128 bytes zeroed) and 256-byte EDIDs with one CTA-861 extension
+// block (Rift CV1 / HDMI VSDB). Fails unless base block (and extension block, if present) checksum cleanly and match OVR.
+inline bool ArcRiftReadEdidFile(const wchar_t* path, char* output256, size_t* outSize = nullptr) {
+    if (!path || !output256) return false;
+    FILE* file = nullptr;
+    if (_wfopen_s(&file, path, L"rb") != 0 || !file) return false;
+    memset(output256, 0, 256);
+    size_t count = fread(output256, 1, 256, file);
+    int extra = fgetc(file);
+    fclose(file);
+    if (extra != EOF || (count != 128 && count != 256)) return false;
+    unsigned sum = 0;
+    for (size_t i = 0; i < 128; ++i) sum += static_cast<unsigned char>(output256[i]);
+    if (sum % 256 != 0 || static_cast<unsigned char>(output256[8]) != 0x3e || static_cast<unsigned char>(output256[9]) != 0xd2) return false;
+    if (count == 256) {
+        unsigned extSum = 0;
+        for (size_t i = 128; i < 256; ++i) extSum += static_cast<unsigned char>(output256[i]);
+        if (extSum % 256 != 0 || static_cast<unsigned char>(output256[126]) < 1) return false;
+    }
+    if (outSize) *outSize = count;
+    return true;
+}
+
+inline bool ArcRiftReadSessionEdid(HMODULE module, char* output256, size_t* outSize = nullptr) {
     wchar_t path[MAX_PATH]{};
     DWORD n = GetModuleFileNameW(module, path, MAX_PATH);
     if (!n || n >= MAX_PATH) return false;
     wchar_t* last = wcsrchr(path, L'\\');
     if (!last || wcscpy_s(last + 1, MAX_PATH - (last + 1 - path), L"rift-s-native-test.edid")) return false;
-    FILE* file = nullptr;
-    if (_wfopen_s(&file, path, L"rb") != 0 || !file) return false;
-    memset(output256, 0, 256);
-    size_t count = fread(output256, 1, 128, file);
-    fclose(file);
-    unsigned sum = 0;
-    for (size_t i = 0; i < 128; ++i) sum += static_cast<unsigned char>(output256[i]);
-    return count == 128 && sum % 256 == 0 && static_cast<unsigned char>(output256[8]) == 0x3e && static_cast<unsigned char>(output256[9]) == 0xd2;
+    return ArcRiftReadEdidFile(path, output256, outSize);
 }
 
 inline ArcRiftEdidMode ArcRiftLoadSessionMode(HMODULE module) {

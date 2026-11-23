@@ -31,7 +31,7 @@ import (
 //go:embed web
 var webFiles embed.FS
 
-const appVersion = "1.5"
+const appVersion = "1.6"
 
 var (
 	root      string
@@ -427,7 +427,12 @@ type identity struct {
 	GPUPnpMatch     string `json:"gpuPnpMatch"`
 	HeadsetModel    string `json:"headsetModel"`
 	HeadsetSerial   string `json:"headsetSerial"`
+	HeadsetProfile  string `json:"headsetProfile,omitempty"`
 	SerialSource    string `json:"serialSource,omitempty"`
+}
+
+func isCV1(monitorInstance string) bool {
+	return strings.HasPrefix(strings.ToUpper(monitorInstance), `DISPLAY\OVR0004\`)
 }
 
 func savedConfig() (*identity, string) {
@@ -647,6 +652,9 @@ func status() map[string]any {
 	s["guardianSession"] = sessionDir != "" && fileExists(filepath.Join(sessionDir, "guardian-setup.txt"))
 	s["guardianSavedNow"] = sessionDir != "" && fileExists(filepath.Join(sessionDir, "guardian-saved.txt"))
 	s["guardianMode"] = metaGuardianMode()
+	s["dashAvailable"] = fileExists(filepath.Join(root, "dash-vulkan-flip.txt")) &&
+		fileExists(filepath.Join(root, "dash-vulkan-semaphore-fix.txt")) &&
+		fileExists(filepath.Join(root, "vk-layer", "arcrift_vk_layer.dll"))
 	s["presentmonAvailable"] = fileExists(filepath.Join(root, "PresentMon.exe"))
 	return s
 }
@@ -675,7 +683,7 @@ func compatible(c identity) map[string]any {
 	if c.MonitorInstance == "" || c.TargetID <= 0 {
 		issues = append(issues, "no headset display recorded; run Setup again")
 	}
-	if !reSerial.MatchString(c.HeadsetSerial) {
+	if !isCV1(c.MonitorInstance) && !reSerial.MatchString(c.HeadsetSerial) {
 		issues = append(issues, "headset serial number not found; open the Meta Horizon app with the headset connected and run Setup again")
 	}
 	gpu := strings.ToUpper(c.GPUPnpMatch)
@@ -723,11 +731,13 @@ func metaGuardianMode() string {
 var reGuardianMode = regexp.MustCompile(`"mode"\s*:\s*"([a-zA-Z_]+)"`)
 
 func startSession(guardian bool) (string, error) {
-	// 1.2.1: tested on an Arc A770 (2026-11-04): Meta's Dash renders with Vulkan and Meta reports the Arc card as not
-	// Vulkan-capable, so Dash quits on every launch ("Failed to configure Rendering Code: -4"). Guardian setup cannot
-	// run; refuse it instead of starting a session that can only crash-loop and stop.
 	if guardian {
-		return "", fmt.Errorf("Meta Guardian setup does not work on Intel Arc: Meta's Dash needs Vulkan, which Meta does not support on this card. Use Draw boundary instead")
+		dashEnabled := fileExists(filepath.Join(root, "dash-vulkan-flip.txt")) &&
+			fileExists(filepath.Join(root, "dash-vulkan-semaphore-fix.txt")) &&
+			fileExists(filepath.Join(root, "vk-layer", "arcrift_vk_layer.dll"))
+		if !dashEnabled {
+			return "", fmt.Errorf("Meta Guardian setup requires dash-vulkan-flip.txt, dash-vulkan-semaphore-fix.txt, and vk-layer\\arcrift_vk_layer.dll. Use Draw boundary instead or enable the Dash Vulkan layer files")
+		}
 	}
 	startMu.Lock()
 	defer startMu.Unlock()
@@ -960,9 +970,13 @@ func analyzeSetup() map[string]any {
 		}
 		// The headset is on some other card while an Arc card is present: say which cable to move.
 		if !strings.Contains(strings.ToLower(id.GPUName), "arc") {
+			cable := "DisplayPort"
+			if isCV1(id.MonitorInstance) {
+				cable = "HDMI"
+			}
 			for _, g := range setupGPU {
 				if strings.Contains(strings.ToUpper(g.PNPDeviceID), "VEN_8086") && strings.Contains(strings.ToLower(g.Name), "arc") && pnpVenDev(g.PNPDeviceID) != id.GPUPnpMatch {
-					gpuWarning = "The headset's DisplayPort cable is plugged into " + id.GPUName + ", not into " + g.Name + ". Plug it into the Arc card, then run Setup again."
+					gpuWarning = "The headset's " + cable + " cable is plugged into " + id.GPUName + ", not into " + g.Name + ". Plug it into the Arc card, then run Setup again."
 					break
 				}
 			}
@@ -994,6 +1008,11 @@ func analyzeSetup() map[string]any {
 	}
 	if oculusUSB > 0 {
 		id.HeadsetModel = "Oculus/Meta USB headset (" + strconv.Itoa(oculusUSB) + " devices)"
+	}
+	if isCV1(id.MonitorInstance) {
+		id.HeadsetProfile = "rift-cv1"
+	} else if id.MonitorInstance != "" {
+		id.HeadsetProfile = "rift-s"
 	}
 	id.HeadsetSerial, id.SerialSource = headsetSerial(headset)
 	warnings := []string{}
@@ -1222,7 +1241,7 @@ func openWindow(url string) *os.Process {
 		filepath.Join(os.Getenv("ProgramFiles"), `Microsoft\Edge\Application\msedge.exe`),
 	} {
 		if fileExists(p) {
-			cmd := exec.Command(p, "--app="+url, "--user-data-dir="+profile, "--window-size=1180,820",
+			cmd := exec.Command(p, "--app="+url, "--user-data-dir="+profile, "--window-size=1120,700",
 				"--no-first-run", "--no-default-browser-check", "--disable-features=Translate")
 			if cmd.Start() == nil {
 				return cmd.Process

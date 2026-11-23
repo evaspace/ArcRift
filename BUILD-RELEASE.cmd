@@ -21,6 +21,15 @@ echo Building bridge_selftest.exe ...
 cl /nologo /EHsc /std:c++17 /W4 /O2 bridge_selftest.cpp /Fo:build\bridge_selftest.obj /Fe:..\bridge_selftest.exe || goto fail
 echo Building arcrift_boundary.exe ...
 cl /nologo /EHsc /std:c++17 /W4 /O2 /MT arcrift_boundary.cpp /Fo:build\arcrift_boundary.obj /Fe:..\arcrift_boundary.exe /link user32.lib || goto fail
+if exist igcl_api.h (
+    echo Building arcrift_igcl_edid.exe ...
+    cl /nologo /EHsc /std:c++17 /W4 /O2 /MT arcrift_igcl_edid.cpp /Fo:build\arcrift_igcl_edid.obj /Fe:..\arcrift_igcl_edid.exe /link user32.lib || goto fail
+)
+if defined VULKAN_SDK if exist "%VULKAN_SDK%\Include\vulkan\vulkan.h" (
+    if not exist ..\vk-layer mkdir ..\vk-layer
+    echo Building vk-layer\arcrift_vk_layer.dll ...
+    cl /nologo /EHsc /std:c++17 /W4 /O2 /MT /LD /I"%VULKAN_SDK%\Include" arcrift_vk_layer.cpp /Fo:build\arcrift_vk_layer.obj /Fe:..\vk-layer\arcrift_vk_layer.dll /link /IMPLIB:build\arcrift_vk_layer.lib || goto fail
+)
 cd /d "%~dp0"
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0write-release-manifest.ps1" || goto fail
 echo.

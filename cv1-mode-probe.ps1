@@ -66,11 +66,30 @@ try {
     $params = 'HKLM:\SYSTEM\CurrentControlSet\Enum\' + $instance + '\Device Parameters'
     $key = $params + '\EDID_OVERRIDE'
 
+    $igclExe = Join-Path $root 'arcrift_igcl_edid.exe'
+    $script:igclUsed = $false
     function Remove-Override {
-        if (-not (Test-Path -LiteralPath $key)) { return }
-        Remove-ItemProperty -LiteralPath $key -Name '0' -ErrorAction SilentlyContinue
-        $item = Get-Item -LiteralPath $key
-        if ($item.ValueCount -eq 0 -and $item.SubKeyCount -eq 0) { Remove-Item -LiteralPath $key }
+        if (Test-Path -LiteralPath $key) {
+            Remove-ItemProperty -LiteralPath $key -Name '0' -ErrorAction SilentlyContinue
+            Remove-ItemProperty -LiteralPath $key -Name '1' -ErrorAction SilentlyContinue
+            $item = Get-Item -LiteralPath $key
+            if ($item.ValueCount -eq 0 -and $item.SubKeyCount -eq 0) { Remove-Item -LiteralPath $key }
+        }
+        if ($script:igclUsed -and (Test-Path -LiteralPath $igclExe)) {
+            & $igclExe --undo | Out-Null
+            $script:igclUsed = $false
+        }
+    }
+    function Write-Override([byte[]]$Edid) {
+        if (-not (Test-Path -LiteralPath $key)) { $null = New-Item -Path $key }
+        $blk0 = [byte[]]::new(128); [Array]::Copy($Edid, 0, $blk0, 0, 128)
+        $null = New-ItemProperty -LiteralPath $key -Name '0' -Value $blk0 -PropertyType Binary -Force
+        if ($Edid.Length -eq 256) {
+            $blk1 = [byte[]]::new(128); [Array]::Copy($Edid, 128, $blk1, 0, 128)
+            $null = New-ItemProperty -LiteralPath $key -Name '1' -Value $blk1 -PropertyType Binary -Force
+        } else {
+            Remove-ItemProperty -LiteralPath $key -Name '1' -ErrorAction SilentlyContinue
+        }
     }
     function Restart-Headset {
         & pnputil.exe /restart-device $instance | Out-Null
@@ -125,7 +144,12 @@ try {
     if (($sum % 256) -ne 0 -or $base[8] -ne 0x3e -or $base[9] -ne 0xd2 -or $ownW -ne 2160 -or $ownH -ne 1200 -or $ownClock -ne 296750000) { throw ('The headset display''s EDID is not the expected Rift CV1 one (found ' + $ownW + 'x' + $ownH + ', pixel clock ' + $ownClock + '). Nothing was changed.') }
 
     # ---- the EDID variants ----
-    function Set-Checksum([byte[]]$e) { $s = 0; for ($i = 0; $i -lt 127; $i++) { $s += $e[$i] }; $e[127] = [byte]((256 - ($s % 256)) % 256) }
+    function Set-Checksum([byte[]]$e) {
+        $s = 0; for ($i = 0; $i -lt 127; $i++) { $s += $e[$i] }; $e[127] = [byte]((256 - ($s % 256)) % 256)
+        if ($e.Length -eq 256) {
+            $s1 = 0; for ($i = 128; $i -lt 255; $i++) { $s1 += $e[$i] }; $e[255] = [byte]((256 - ($s1 % 256)) % 256)
+        }
+    }
     function Set-Name([byte[]]$e, [string]$Name) {
         foreach ($o in 72, 90, 108) {
             if ($e[$o] -eq 0 -and $e[$o + 1] -eq 0 -and $e[$o + 3] -eq 0xFC) {
@@ -133,6 +157,25 @@ try {
                 for ($i = 0; $i -lt 13; $i++) { $e[$o + 5 + $i] = if ($i -lt $text.Length) { $text[$i] } elseif ($i -eq $text.Length) { 0x0A } else { 0x20 } }
             }
         }
+    }
+    # Appends a clean 128-byte CTA-861 rev 3 extension block with an HDMI 1.4 VSDB (OUI 00-0C-03) declaring
+    # Max_TMDS_Clock = $MaxTmdsMhz (in 5 MHz steps, e.g. 300 or 340 MHz) so strict HDMI 2.0/2.1 drivers (such as
+    # Intel Arc B580) do not clamp the link to single-link DVI's 165 MHz cap.
+    function Add-HdmiVsdbBlock([byte[]]$Base128, [int]$MaxTmdsMhz) {
+        $out = [byte[]]::new(256)
+        [Array]::Copy($Base128, 0, $out, 0, 128)
+        $out[126] = 1
+        $out[128] = 0x02 # CTA-861 tag
+        $out[129] = 0x03 # revision 3
+        $out[130] = 0x0C # DTD offset (4-byte header + 8-byte HDMI VSDB)
+        $out[131] = 0x00 # flags (RGB only, 0 native DTDs)
+        $out[132] = 0x67 # Vendor-Specific Data Block (tag=3, len=7)
+        $out[133] = 0x03; $out[134] = 0x0C; $out[135] = 0x00 # IEEE OUI 00-0C-03 (HDMI Licensing)
+        $out[136] = 0x10; $out[137] = 0x00 # Source Physical Address 1.0.0.0
+        $out[138] = 0x00 # AI / deep color flags
+        $out[139] = [byte]([math]::Floor($MaxTmdsMhz / 5)) # Max_TMDS_Clock in 5 MHz units
+        Set-Checksum $out
+        return ,$out
     }
     # Writes the first detailed timing. Clock in units of 10 kHz. Image size, border and sync flags stay as they are.
     function Set-Timing([byte[]]$e, [int]$Clock, [int]$HBlank, [int]$VBlank, [int]$HFront, [int]$HSync, [int]$VFront, [int]$VSync) {
@@ -143,12 +186,16 @@ try {
         $e[64] = [byte]((($VFront -band 0x0F) -shl 4) -bor ($VSync -band 0x0F))
         $e[65] = [byte]((($HFront -shr 8) -shl 6) -bor (($HSync -shr 8) -shl 4) -bor (($VFront -shr 4) -shl 2) -bor ($VSync -shr 4))
     }
-    function New-Variant([string]$Tag, [string]$What, [bool]$Usable, [int]$Hz, [scriptblock]$Change) {
+    function New-Variant([string]$Tag, [string]$What, [bool]$Usable, [int]$Hz, [scriptblock]$Change, [int]$HdmiMaxTmdsMhz = 0) {
         $e = [byte[]]$base.Clone()
+        # Clear extension count on 128-byte variants so Windows never sees a dangling extension count without block 1.
+        $e[126] = 0
         if ($Change) { & $Change $e }
         # The name carries this run's number, so a description left over from an earlier run cannot pass for this one.
         $name = 'Rift ' + $Tag + ' ' + $runId
-        Set-Name $e $name; Set-Checksum $e
+        Set-Name $e $name
+        if ($HdmiMaxTmdsMhz -gt 0) { $e = Add-HdmiVsdbBlock $e $HdmiMaxTmdsMhz }
+        else { Set-Checksum $e }
         return [pscustomobject]@{ Tag = $Tag; What = $What; Usable = $Usable; Hz = $Hz; Name = $name; Edid = $e }
     }
     function Get-Name([byte[]]$e) {
@@ -171,7 +218,9 @@ try {
     }
     # The CV1's own timing: 2160x1200, 80 blank columns (front 8, sync 32), 272 blank lines (front 50, sync 2), 296.75 MHz.
     $variants = @(
-        (New-Variant 'own' 'the headset''s own EDID again, unchanged except its name (control: is an override picked up at all?)' $true 90 $null)
+        (New-Variant 'hdmi340' 'own exact timing + CTA-861 HDMI VSDB (Max TMDS 340 MHz) to unlock >165 MHz HDMI clocks on strict drivers (Arc B580)' $true 90 $null 340)
+        (New-Variant 'hdmi300' 'own exact timing (297.00 MHz standard HDMI clock) + CTA-861 HDMI VSDB (Max TMDS 300 MHz)' $true 90 { param($e) Set-Timing $e 29700 80 272 8 32 50 2 } 300)
+        (New-Variant 'own' 'the headset''s own EDID again, 128-byte base block only (control: is an override picked up at all?)' $true 90 $null)
         (New-Variant 'c297' 'same picture and layout, pixel clock 297.00 MHz instead of 296.75 (a standard HDMI clock; 90.07 Hz)' $true 90 { param($e) Set-Timing $e 29700 80 272 8 32 50 2 })
         (New-Variant 'rb' 'ordinary monitor blanking (160 columns, 35 lines), 257.87 MHz, 90 Hz' $false 90 { param($e) Set-Timing $e 25787 160 35 48 32 3 10 })
         (New-Variant '60hz' 'own layout at 60 Hz, 197.84 MHz' $false 60 { param($e) Set-Timing $e 19784 80 272 8 32 50 2 })
@@ -179,7 +228,7 @@ try {
     )
 
     Add-Line 'ArcRift Rift CV1 display-mode test'
-    Add-Line ('Report format 2, ArcRift 1.5, written ' + (Get-Date -Format 'yyyy-MM-dd HH:mm') + '. No serial numbers are in this file.')
+    Add-Line ('Report format 2, ArcRift 1.6, written ' + (Get-Date -Format 'yyyy-MM-dd HH:mm') + '. No serial numbers are in this file.')
     Add-Section 'System'
     try {
         $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
@@ -206,14 +255,45 @@ try {
         $r = [pscustomobject]@{ Tag = $v.Tag; Usable = $v.Usable; PickedUp = $false; Tested = $false; Offered = $false; OfferedHz = ''; Test = $null; Output = $false; Signal = '' }
         $results.Add($r)
         if ($v.Edid) {
-            if (-not (Test-Path -LiteralPath $key)) { $null = New-Item -Path $key }
-            $null = New-ItemProperty -LiteralPath $key -Name '0' -Value ([byte[]]$v.Edid) -PropertyType Binary -Force
+            if ($script:igclUsed -and (Test-Path -LiteralPath $igclExe)) { & $igclExe --undo | Out-Null; $script:igclUsed = $false }
+            Write-Override ([byte[]]$v.Edid)
         }
         $restart = Restart-Headset
         $source = Wait-Source
         if (-not $source) { Add-Line ('    the headset display did not come back onto the desktop within 25 s (monitor restart result ' + $restart + ')'); continue }
         $state = Get-HeadsetState
         $r.PickedUp = [bool]($state -and $state.Name -eq $v.Name)
+        if ($v.Edid -and -not $r.PickedUp -and (Test-Path -LiteralPath $igclExe)) {
+            # Arc B580 fallback: try Intel IGCL driver-level EDID override before asking for an HDMI re-plug.
+            # Ensure arcrift-identity.txt matches this CV1 monitor and its Intel parent adapter.
+            $uidMatch = [regex]::Match($instance, '(?i)UID(\d+)')
+            $parentPnp = ''
+            try { $parentPnp = [string](Get-PnpDeviceProperty -InstanceId $instance -KeyName DEVPKEY_Device_Parent -ErrorAction Stop).Data } catch {}
+            $gpuM = [regex]::Match($parentPnp, '(?i)VEN_([0-9A-F]{4})&DEV_([0-9A-F]{4})')
+            if ($uidMatch.Success -and $gpuM.Success -and $gpuM.Groups[1].Value -eq '8086') {
+                $idLines = @(
+                    ('target=' + $uidMatch.Groups[1].Value),
+                    ('monitor=' + ($instance -replace '\\', '#') + '#'),
+                    ('gpu=' + ($gpuM.Groups[1].Value + ':' + $gpuM.Groups[2].Value).ToUpperInvariant())
+                )
+                Set-Content -LiteralPath (Join-Path $root 'arcrift-identity.txt') -Value $idLines -Encoding Ascii
+                Remove-Override
+                $null = Restart-Headset
+                $null = Wait-Source 15
+                $tmpEdid = Join-Path $root 'cv1-probe-temp.edid'
+                [IO.File]::WriteAllBytes($tmpEdid, [byte[]]$v.Edid)
+                $igclOut = & $igclExe --override --edid $tmpEdid --replace 2>&1
+                Remove-Item -LiteralPath $tmpEdid -ErrorAction SilentlyContinue
+                if ($LASTEXITCODE -eq 0) {
+                    $script:igclUsed = $true
+                    Add-Line ('    trying Intel driver-level EDID override (IGCL): ' + (($igclOut | Select-Object -Last 1) -as [string]))
+                    Start-Sleep -Seconds 4
+                    $source = Wait-Source 20
+                    $state = if ($source) { Get-HeadsetState } else { $null }
+                    $r.PickedUp = [bool]($state -and $state.Name -eq $v.Name)
+                }
+            }
+        }
         for ($try = 1; $v.Edid -and -not $r.PickedUp -and $try -le 2; $try++) {
             Request-Replug ('[' + $v.Tag + '] Windows is still using the previous display description (it shows "' + $(if ($state) { $state.Name }) + '").')
             $source = Wait-Source 40
@@ -281,9 +361,11 @@ try {
         $summary.Add('RESULT: after a plain restart of the headset monitor, Windows offered and output 2160x1200 at 90 Hz. A VR session does that restart by itself: press Start VR session again.')
     } elseif ($working.Count) {
         $chosen = $variants | Where-Object { $_.Tag -eq $working[0].Tag }
-        [IO.File]::WriteAllBytes($overridePath, [byte[]]$chosen.Edid)
+        $savedEdid = [byte[]]$chosen.Edid.Clone()
+        if ($ownName) { Set-Name $savedEdid $ownName; Set-Checksum $savedEdid }
+        [IO.File]::WriteAllBytes($overridePath, $savedEdid)
         $summary.Add('RESULT: variant [' + $chosen.Tag + '] works: Windows offered and output ' + $working[0].Signal + '.')
-        $summary.Add('It is saved as cv1-override.edid (it contains the headset serial; do not post that file). Press Start VR session again: the session now uses it as a temporary display mode.')
+        $summary.Add('It is saved as cv1-override.edid (' + $savedEdid.Length + ' bytes; contains the headset serial, do not post that file). Press Start VR session again: the session now uses it as a temporary display mode.')
     } elseif ($pickedUp -eq 0) {
         $summary.Add('RESULT: Windows did not pick up any EDID override for the headset display on this PC, even after re-plugging, so this route cannot work here.')
     } elseif ($offeredTags.Count) {
@@ -301,8 +383,10 @@ try {
     $summary.Add('TEST STOPPED: ' + $_.Exception.Message)
     # Never leave an override behind.
     try {
+        if ($script:igclUsed -and (Test-Path -LiteralPath $igclExe)) { & $igclExe --undo | Out-Null; $script:igclUsed = $false }
         if ($key -and (Test-Path -LiteralPath $key) -and (Test-Path -LiteralPath $markerPath)) {
             Remove-ItemProperty -LiteralPath $key -Name '0' -ErrorAction SilentlyContinue
+            Remove-ItemProperty -LiteralPath $key -Name '1' -ErrorAction SilentlyContinue
             $item = Get-Item -LiteralPath $key
             if ($item.ValueCount -eq 0 -and $item.SubKeyCount -eq 0) { Remove-Item -LiteralPath $key }
             & pnputil.exe /restart-device $instance | Out-Null

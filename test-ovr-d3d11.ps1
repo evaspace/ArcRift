@@ -48,6 +48,7 @@ $start = Get-Date
 $failed = $false
 $metaCrashAt = $null  # set when the session stops because Meta's runtime crashed (decides the automatic restart)
 $edidChanged = $false
+$igclEdidChanged = $false
 # Release 1.4 (Rift CV1): the display mode a CV1 session switches to, and whether it has switched.
 $modeSwitch = $null
 $modeChanged = $false
@@ -141,17 +142,60 @@ function Select-ArcRiftHeadsetMode([string[]]$Offered) {
     if ($fit.Count) { return $fit[0] }
     return $null
 }
+# Validates a 128-byte or 256-byte EDID's block checksum(s).
+function Test-ArcRiftEdidChecksum([byte[]]$Edid) {
+    if (-not $Edid -or ($Edid.Length -ne 128 -and $Edid.Length -ne 256)) { return $false }
+    $sum0 = 0; for ($i = 0; $i -lt 128; $i++) { $sum0 += $Edid[$i] }
+    if (($sum0 % 256) -ne 0) { return $false }
+    if ($Edid.Length -eq 256) {
+        if ($Edid[126] -lt 1) { return $false }
+        $sum1 = 0; for ($i = 128; $i -lt 256; $i++) { $sum1 += $Edid[$i] }
+        if (($sum1 % 256) -ne 0) { return $false }
+    }
+    return $true
+}
+# Finds the 18-byte serial descriptor (0xFF) offset among EDID descriptor slots 72, 90, 108; -1 if absent.
+function Get-ArcRiftEdidSerialOffset([byte[]]$Edid) {
+    foreach ($o in 72, 90, 108) {
+        if ($Edid[$o] -eq 0 -and $Edid[$o + 1] -eq 0 -and $Edid[$o + 3] -eq 0xFF) { return $o }
+    }
+    return -1
+}
+# Writes a 128-byte or 256-byte EDID into Windows' EDID_OVERRIDE key ('0', and '1' when 256 bytes).
+function Set-ArcRiftEdidOverride([string]$KeyPath, [byte[]]$Edid) {
+    if (-not (Test-Path -LiteralPath $KeyPath)) { New-Item -Path $KeyPath | Out-Null }
+    $blk0 = [byte[]]::new(128); [Array]::Copy($Edid, 0, $blk0, 0, 128)
+    New-ItemProperty -LiteralPath $KeyPath -Name '0' -Value $blk0 -PropertyType Binary -Force | Out-Null
+    if ($Edid.Length -eq 256) {
+        $blk1 = [byte[]]::new(128); [Array]::Copy($Edid, 128, $blk1, 0, 128)
+        New-ItemProperty -LiteralPath $KeyPath -Name '1' -Value $blk1 -PropertyType Binary -Force | Out-Null
+    } else {
+        Remove-ItemProperty -LiteralPath $KeyPath -Name '1' -ErrorAction SilentlyContinue
+    }
+}
+function Remove-ArcRiftEdidOverride([string]$KeyPath) {
+    if (-not (Test-Path -LiteralPath $KeyPath)) { return }
+    Remove-ItemProperty -LiteralPath $KeyPath -Name '0' -ErrorAction SilentlyContinue
+    Remove-ItemProperty -LiteralPath $KeyPath -Name '1' -ErrorAction SilentlyContinue
+    $k = Get-Item -LiteralPath $KeyPath
+    if ($k.ValueCount -eq 0 -and $k.SubKeyCount -eq 0) { Remove-Item -LiteralPath $KeyPath }
+}
 # Release 1.4 (Rift CV1): the temporary EDID that "CV1 MODE TEST.cmd" found to work on this PC (cv1-override.edid).
-# It is only accepted when it is this headset's own EDID with nothing changed that the headset could notice: same
-# maker, product and serial, same picture size, same line and frame layout, and a pixel clock within 0.5 %.
+# Accepts 128-byte or 256-byte (with CTA-861 HDMI VSDB extension) overrides that keep this headset's maker, product,
+# serial descriptor, picture size, line/frame layout, and pixel clock within 0.5 %.
 function Get-ArcRiftCv1Override([string]$Path, [byte[]]$Own) {
     $o = [IO.File]::ReadAllBytes($Path)
-    $sum = 0; foreach ($b in $o) { $sum += $b }
-    if ($o.Length -ne 128 -or ($sum % 256) -ne 0) { throw 'cv1-override.edid is damaged. Delete it and run "CV1 MODE TEST.cmd" again. No changes made.' }
+    if (-not (Test-ArcRiftEdidChecksum $o)) { throw 'cv1-override.edid is damaged. Delete it and run "CV1 MODE TEST.cmd" again. No changes made.' }
     $ownMode = Get-ArcRiftEdidMode $Own
     $newMode = Get-ArcRiftEdidMode $o
     $sameHeadset = $true
-    foreach ($i in ((8..15) + (90..107))) { if ($o[$i] -ne $Own[$i]) { $sameHeadset = $false } }
+    foreach ($i in 8..15) { if ($o[$i] -ne $Own[$i]) { $sameHeadset = $false } }
+    $ownSer = Get-ArcRiftEdidSerialOffset $Own
+    if ($ownSer -ge 0) {
+        $newSer = Get-ArcRiftEdidSerialOffset $o
+        if ($newSer -lt 0) { $sameHeadset = $false }
+        else { for ($i = 0; $i -lt 18; $i++) { if ($o[$newSer + $i] -ne $Own[$ownSer + $i]) { $sameHeadset = $false } } }
+    }
     if (-not $sameHeadset -or $newMode.Width -ne $ownMode.Width -or $newMode.Height -ne $ownMode.Height -or $newMode.TotalWidth -ne $ownMode.TotalWidth -or $newMode.TotalHeight -ne $ownMode.TotalHeight -or [math]::Abs($newMode.PixelClock - $ownMode.PixelClock) -gt ($ownMode.PixelClock * 0.005)) {
         throw 'cv1-override.edid is not for this headset, or changes more than a session allows. Delete it and run "CV1 MODE TEST.cmd" again. No changes made.'
     }
@@ -185,7 +229,7 @@ try {
             $adapterId = ($adapterMatch.Groups[1].Value + ':' + $adapterMatch.Groups[2].Value).ToUpperInvariant()
             $savedId = ($gpuMatch.Groups[1].Value + ':' + $gpuMatch.Groups[2].Value).ToUpperInvariant()
             if ($adapterMatch.Groups[1].Value -ne '8086') {
-                $gpuProblem = 'The headset is plugged into a graphics card that is not an Intel card (' + $adapterId + '). Plug its DisplayPort cable into the Intel Arc card, then run Setup again. No changes made.'
+                $gpuProblem = 'The headset is plugged into a graphics card that is not an Intel card (' + $adapterId + '). Plug its ' + $headsetProfile.Cable + ' cable into the Intel Arc card, then run Setup again. No changes made.'
             } elseif ($adapterId -ne $savedId) {
                 $identityLines += ('gpu=' + $adapterId)
                 $gpuNote = 'Note: the headset is plugged into Intel graphics device ' + $adapterId + ', but Setup saved ' + $savedId + '. Using the card it is plugged into. Run Setup again to update the saved card.'
@@ -197,17 +241,24 @@ try {
     # Rift S display mode (EDID) for this headset: public Rift S capture timings + this headset's serial,
     # which Meta uses to pair the display with the headset. Rebuilt every session; never flashed to hardware.
     if ($headsetProfile.OwnEdid) {
-        # Rift CV1: the headset display's own EDID, exactly as Windows read it from the headset (its first 128 bytes).
-        # It already holds the real mode and the serial Meta pairs the display with, so nothing is made up here and
-        # nothing is written to the headset or to Windows. The bridge hands these bytes to Meta.
+        # Rift CV1: the headset display's own EDID, as Windows read it from the headset (128 bytes, or 256 bytes if it
+        # carries a valid CTA-861 extension block). It already holds the real mode and serial Meta pairs with.
         $ownEdid = $null
         try { $ownEdid = [byte[]](Get-ItemProperty -LiteralPath ('HKLM:\SYSTEM\CurrentControlSet\Enum\' + $monitorInstance + '\Device Parameters') -Name EDID -ErrorAction Stop).EDID } catch { }
         if (-not $ownEdid -or $ownEdid.Length -lt 128) { throw ('Windows has no EDID stored for the ' + $headsetProfile.Name + ' display. Plug the headset in (USB and ' + $headsetProfile.Cable + '), then run Setup again. No changes made.') }
-        $edidBytes = [byte[]]::new(128)
-        [Array]::Copy($ownEdid, $edidBytes, 128)
-        $edidSum = 0; for ($i = 0; $i -lt 128; $i++) { $edidSum += $edidBytes[$i] }
+        $takeLen = if ($ownEdid.Length -ge 256 -and $ownEdid[126] -ge 1) { 256 } else { 128 }
+        $edidBytes = [byte[]]::new($takeLen)
+        [Array]::Copy($ownEdid, $edidBytes, $takeLen)
+        if ($takeLen -eq 256 -and -not (Test-ArcRiftEdidChecksum $edidBytes)) {
+            # Extension block damaged or extra blocks beyond 1: fall back to a clean 128-byte base block with extensions=0.
+            $edidBytes = [byte[]]::new(128)
+            [Array]::Copy($ownEdid, $edidBytes, 128)
+            $edidBytes[126] = 0
+            $s0 = 0; for ($i = 0; $i -lt 127; $i++) { $s0 += $edidBytes[$i] }
+            $edidBytes[127] = [byte]((256 - ($s0 % 256)) % 256)
+        }
         $ownMode = Get-ArcRiftEdidMode $edidBytes
-        if (($edidSum % 256) -ne 0 -or $edidBytes[8] -ne 0x3e -or $edidBytes[9] -ne 0xd2 -or $ownMode.Width -ne $headsetProfile.Width -or $ownMode.Height -ne $headsetProfile.Height -or $ownMode.PixelClock -ne $headsetProfile.PixelClock) {
+        if (-not (Test-ArcRiftEdidChecksum $edidBytes) -or $edidBytes[8] -ne 0x3e -or $edidBytes[9] -ne 0xd2 -or $ownMode.Width -ne $headsetProfile.Width -or $ownMode.Height -ne $headsetProfile.Height -or $ownMode.PixelClock -ne $headsetProfile.PixelClock) {
             throw ('The headset display''s own EDID is not the expected ' + $headsetProfile.Name + ' one (' + $headsetProfile.Width + 'x' + $headsetProfile.Height + ', pixel clock ' + $headsetProfile.PixelClock + '); found ' + $ownMode.Width + 'x' + $ownMode.Height + ', pixel clock ' + $ownMode.PixelClock + '. No changes made.')
         }
     } else {
@@ -225,7 +276,7 @@ try {
     [IO.File]::WriteAllBytes((Join-Path $root 'rift-s-native-test.edid'), $edidBytes)
     . (Join-Path $root 'install-paths.ps1')
     $metaRuntime = Get-ArcRiftMetaRuntimePath
-    if ($SteamVR) {
+    if ($SteamVR -and -not $GuardianSetup) {
         $steamPath = Get-ArcRiftSteamPath
         $steamRoot = Get-ArcRiftSteamVRPath $steamPath
         $steamBin = Join-Path $steamRoot 'bin\win64'
@@ -680,7 +731,8 @@ try {
         if ($workerProof.Integrity -ne 8192) { throw 'Normal-user worker preflight failed.' }
         if (-not $GuardianSetup -and -not (Get-Process steam -ErrorAction SilentlyContinue)) { throw 'Steam is not running. Start Steam and sign in, then start the session again; no changes made.' }
         if (-not (Get-Process OVRServer_x64 -ErrorAction SilentlyContinue)) { throw 'Meta runtime is not running. Open the Meta Horizon app with the headset plugged in, then start the session again; no changes made.' }
-        foreach ($p in @(Get-Process OVRServer_x64,steam,explorer -ErrorAction Stop)) {
+        $checkProcs = if ($GuardianSetup) { @('OVRServer_x64','explorer') } else { @('OVRServer_x64','steam','explorer') }
+        foreach ($p in @(Get-Process -Name $checkProcs -ErrorAction Stop)) {
             $rid = [ArcRiftIntegrityProbe]::Integrity($p.Id)
             # Release 1.3: an extra explorer.exe (opened for a folder window) can exit before it is checked. The
             # desktop's own Explorer is checked again when SteamVR is launched through it.
@@ -706,7 +758,7 @@ try {
     try { $sessionLock = [IO.File]::Open($sessionLockPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::Write, [IO.FileShare]::None) }
     catch { throw 'Another ArcRift session or recovery is using this folder right now (active-test.lock is in use). Wait for it to finish, then start again; no changes made.' }
     [pscustomobject]@{SessionDirectory=$out; HarnessPid=$PID; Started=(Get-Date)} | Export-Clixml $activeSession
-    if ($SteamVR) {
+    if ($SteamVR -and -not $GuardianSetup) {
         if (-not (Test-Path (Join-Path $steamBin 'vrcmd.exe'))) { throw 'Installed SteamVR diagnostic is missing.' }
         $existing = @(Get-Process | Where-Object { $_.Path -and $_.Path.StartsWith($steamRoot + '\', [StringComparison]::OrdinalIgnoreCase) })
         if ($existing.Count -or (Get-Process vrserver,vrcompositor,vrmonitor -ErrorAction SilentlyContinue)) { throw 'SteamVR already running; refusing to interrupt an existing session.' }
@@ -721,7 +773,7 @@ try {
         $monitor = Get-PnpDevice -InstanceId $monitorInstance -PresentOnly
         if ($monitor.Class -ne 'Monitor') { throw 'Verified headset monitor is missing.' }
         $testEdid = [IO.File]::ReadAllBytes((Join-Path $root 'rift-s-native-test.edid'))
-        if ($testEdid.Length -ne 128 -or (($testEdid | Measure-Object -Sum).Sum % 256) -ne 0) { throw 'Invalid native test EDID.' }
+        if (-not (Test-ArcRiftEdidChecksum $testEdid)) { throw 'Invalid native test EDID.' }
         # Release 1.4: the mode is read from the EDID and must be exactly the profile's tested mode (Rift S: 1440x2560,
         # pixel clock 571570000, as before). $nativeSignal is how display_probe.exe prints that mode once it is live.
         $nativeMode = Get-ArcRiftEdidMode $testEdid
@@ -962,24 +1014,48 @@ try {
             $nativeFirstWait = 2
         } else {
         $edidChanged = $true
-        New-Item -Path $edidKey | Out-Null
-        New-ItemProperty -LiteralPath $edidKey -Name '0' -Value $registryEdid -PropertyType Binary -Force | Out-Null
-        Write-Output ('Temporary published native timing applied ONLY to verified ' + $headsetProfile.Name + ' monitor. Not a firmware write.')
+        Set-ArcRiftEdidOverride $edidKey $registryEdid
+        Write-Output ('Temporary published native timing applied ONLY to verified ' + $headsetProfile.Name + ' monitor (' + $registryEdid.Length + ' bytes). Not a firmware write.')
         & pnputil.exe /restart-device $monitorInstance
         if ($LASTEXITCODE -ne 0) { throw 'Headset monitor restart failed.' }
+        $igclExe = Join-Path $root 'arcrift_igcl_edid.exe'
         if ($headsetProfile.OwnEdid) {
             # Rift CV1 with the temporary EDID from CV1 MODE TEST. Unlike a Rift S, the headset display keeps its
             # identity, so Windows comes back in the mode it has saved for it (1920x1080): wait for the display,
             # check that its own mode is offered now, and switch to it. Temporary, as in the branch above.
             $wantedMode = $null
             $modeSource = $null
-            $switchDeadline = (Get-Date).AddSeconds(30)
+            $switchDeadline = (Get-Date).AddSeconds(20)
             Start-Sleep -Seconds 3
             while ($true) {
                 $modeSource = [ArcRiftDisplayMode]::Source($headsetPathId)
                 if ($modeSource) { Start-Sleep -Seconds 2; $wantedMode = Select-ArcRiftHeadsetMode @([ArcRiftDisplayMode]::Modes($modeSource)) }
                 if ($wantedMode -or (Get-Date) -gt $switchDeadline) { break }
                 Start-Sleep -Milliseconds 500
+            }
+            if (-not $wantedMode -and (Test-Path -LiteralPath $igclExe)) {
+                # Arc B580 fallback: Windows EDID_OVERRIDE + monitor restart is often ignored on Battlemage.
+                # Intel IGCL requires OS EDID_OVERRIDE to be absent (OS override takes precedence).
+                Write-Output 'Windows did not pick up the temporary CV1 EDID via monitor restart; trying Intel driver-level EDID override (IGCL)...'
+                Remove-ArcRiftEdidOverride $edidKey
+                $edidChanged = $false
+                & pnputil.exe /restart-device $monitorInstance | Out-Null
+                Start-Sleep -Seconds 3
+                'IGCL driver-level EDID override applied for this session.' | Set-Content -LiteralPath (Join-Path $out 'igcl-edid-override.txt')
+                $igclEdidChanged = $true
+                $igclOut = & $igclExe --override --edid (Join-Path $out 'temporary-native.edid') --replace 2>&1
+                $igclOut | Out-File -Encoding utf8 (Join-Path $out 'igcl-edid-apply.txt')
+                Write-Output ('IGCL override: ' + (($igclOut | Select-Object -Last 1) -as [string]))
+                if ($LASTEXITCODE -eq 0) {
+                    $igclDeadline = (Get-Date).AddSeconds(20)
+                    Start-Sleep -Seconds 3
+                    while ($true) {
+                        $modeSource = [ArcRiftDisplayMode]::Source($headsetPathId)
+                        if ($modeSource) { Start-Sleep -Seconds 2; $wantedMode = Select-ArcRiftHeadsetMode @([ArcRiftDisplayMode]::Modes($modeSource)) }
+                        if ($wantedMode -or (Get-Date) -gt $igclDeadline) { break }
+                        Start-Sleep -Milliseconds 500
+                    }
+                }
             }
             if (-not $wantedMode) { throw ('With the temporary display mode from CV1 MODE TEST applied, Windows still does not offer ' + $nativeSize + ' at ' + $headsetProfile.Hz + ' Hz. Run "CV1 MODE TEST.cmd" again and send its report.') }
             $modeSwitch.Hz = $wantedMode.Hz
@@ -997,6 +1073,8 @@ try {
         # after the monitor restart. Check at 6 s as before, then every 2 s; the last capture is kept.
         # Release 1.3: wait up to 45 s (was 20 s). A PC that is ready sooner continues at once, as before.
         $nativeDeadline = (Get-Date).AddSeconds(45)
+        $igclFallbackAt = (Get-Date).AddSeconds(14)
+        $igclTried = $igclEdidChanged
         Start-Sleep -Seconds $nativeFirstWait
         $nativeWaitTold = $false
         while ($true) {
@@ -1004,6 +1082,23 @@ try {
             $probe = Get-Content (Join-Path $out 'physical-display-after-runtime-start.txt') -Raw
             $match = [regex]::Match($probe, '(?m)^\s*target=' + $targetId + ' [^\r\n]*' + $activePathFlags + '[^\r\n]*\r?\n[^\r\n]*(?i:' + [regex]::Escape($headsetPathId) + ')[^\r\n]*\r?\n\s*' + $nativeSignalPattern + ' vSync=(\d+)/(\d+)')
             if ($match.Success -or (Get-Date) -gt $nativeDeadline) { break }
+            if ($useTemporaryEdid -and -not $headsetProfile.OwnEdid -and -not $igclTried -and (Get-Date) -ge $igclFallbackAt -and (Test-Path -LiteralPath (Join-Path $root 'arcrift_igcl_edid.exe'))) {
+                # Arc B580 Rift S fallback: if Windows EDID_OVERRIDE was not picked up after ~14 s, switch to Intel IGCL override.
+                $igclTried = $true
+                Write-Output 'Windows did not pick up the temporary EDID via monitor restart; trying Intel driver-level EDID override (IGCL)...'
+                Remove-ArcRiftEdidOverride $edidKey
+                $edidChanged = $false
+                & pnputil.exe /restart-device $monitorInstance | Out-Null
+                Start-Sleep -Seconds 3
+                'IGCL driver-level EDID override applied for this session.' | Set-Content -LiteralPath (Join-Path $out 'igcl-edid-override.txt')
+                $igclEdidChanged = $true
+                $igclOut = & (Join-Path $root 'arcrift_igcl_edid.exe') --override --edid (Join-Path $out 'temporary-native.edid') --replace 2>&1
+                $igclOut | Out-File -Encoding utf8 (Join-Path $out 'igcl-edid-apply.txt')
+                Write-Output ('IGCL override: ' + (($igclOut | Select-Object -Last 1) -as [string]))
+                $nativeDeadline = (Get-Date).AddSeconds(25)
+                Start-Sleep -Seconds 3
+                continue
+            }
             if (-not $nativeWaitTold) { Write-Output 'Waiting for the headset to come back in its native display mode...'; $nativeWaitTold = $true }
             Start-Sleep -Seconds 2
         }
@@ -1023,7 +1118,7 @@ try {
         if ($VRChatTrial -and -not $ManualSession -and $holdSeconds -ne $vrchatSettings.NativeHoldSeconds) { throw 'VRChat/native-helper time budgets do not match; refusing source apply.' }
         $sourceExe='native_source_test.exe'; $sourceArgs='--hold-managed '+$holdSeconds
         if ($ManualSession) { $sourceExe='native_source_session.exe'; $sourceArgs='--hold-session '+$PID }
-        $sourceHelper = Start-Process -FilePath (Join-Path $root $sourceExe) -ArgumentList $sourceArgs -WorkingDirectory $out -RedirectStandardOutput (Join-Path $out 'native-source.txt') -RedirectStandardError (Join-Path $out 'native-source-stderr.txt') -PassThru
+        $sourceHelper = Start-Process -FilePath (Join-Path $root $sourceExe) -ArgumentList $sourceArgs -WorkingDirectory $out -RedirectStandardOutput (Join-Path $out 'native-source.txt') -RedirectStandardError (Join-Path $out 'native-source-stderr.txt') -WindowStyle Hidden -PassThru
         $null = $sourceHelper.Handle
         $readyDeadline = (Get-Date).AddSeconds(5)
         while (-not (Test-Path (Join-Path $out 'native-source-ready.txt'))) {
@@ -1033,11 +1128,17 @@ try {
         Write-Output 'Native desktop verified. Full EDID/runtime rollback is managed and verified by this harness; source-only timeout restore is NOT guaranteed.'
     }
     if ($GuardianSetup) {
-        # Release 1.2.1: Guardian setup. Meta runs it inside Dash; ArcRift only watches and guards, then restores on Stop.
+        # Release 1.2.1+: Guardian setup / Meta Dash session. Meta runs Dash (and Oculus-native apps); ArcRift watches and guards, then restores on Stop.
         'Guardian setup session (Meta Dash allowed, SteamVR not started).' | Set-Content (Join-Path $out 'guardian-setup.txt')
         $guardianDir = Join-Path $env:LOCALAPPDATA 'Oculus'
         $guardianSaved = $false
+        $guardianBaselineFile = $null
+        $guardianBaselineLen = 0L
+        $guardianExistingNoted = $false
+        $gbInit = Get-ChildItem $guardianDir -Filter 'GuardianBoundary_*.txt' -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -ge $start } | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+        if ($gbInit) { $guardianBaselineFile = $gbInit.FullName; $guardianBaselineLen = $gbInit.Length }
         $dashIds = @{}
+        $dashBoosted = @{}
         $dashStarts = New-Object System.Collections.Generic.List[datetime]
         $observationStart = Get-Date
         $nextEventCheck = Get-Date
@@ -1055,6 +1156,60 @@ try {
             $server = @(Get-Process OVRServer_x64 -ErrorAction SilentlyContinue)
             if ($server.Count -ne 1 -or $server[0].Id -ne $serverId) { throw 'Meta runtime exited or restarted during Guardian setup.' }
             if ($sourceHelper -and $sourceHelper.HasExited) { throw 'Native source helper exited during Guardian setup.' }
+            # Meta crash and freeze watchdogs (same as normal manual session).
+            if ((Get-Date) -ge $metaLogCheckAt) {
+                $metaLogCheckAt = (Get-Date).AddSeconds(1)
+                $metaLogNow = Get-ChildItem $guardianDir -Filter 'Service_*.txt' -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -ge $start } | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+                if ($metaLogNow -and $metaLogNow.FullName -ne $metaLogPath) {
+                    if ($metaLogPath) { $metaLogOffset = 0L } else { $metaLogOffset = $metaLogNow.Length }
+                    $metaLogPath = $metaLogNow.FullName
+                    $metaLastGrowth = Get-Date
+                    if (-not $trackingForcedChecked) {
+                        $trackingForcedChecked = $true
+                        try {
+                            [long]$metaLogFromStart = 0
+                            if ((Read-AppendedBridgeLog $metaLogPath ([ref]$metaLogFromStart)) -match 'Tracking was forced on by regkey') {
+                                Write-Output 'Tracking stays on while the headset is off (Meta setting ForceSensorTracking), so taking it off or putting it down no longer makes Meta pause tracking.'
+                            } else {
+                                Write-Output 'Note: Meta''s runtime did not confirm the keep-tracking-on setting (ForceSensorTracking). Putting the headset down for a while may still crash it.'
+                            }
+                        } catch { Write-Output ('Keep-tracking-on check note (session unaffected): ' + $_.Exception.Message) }
+                    }
+                }
+            }
+            if ((Get-Date) -ge $metaCrashCheckAt) {
+                $metaCrashCheckAt = (Get-Date).AddSeconds(2)
+                $metaCrashes = @(Get-ArcRiftNewMetaCrash)
+                if ($metaCrashes.Count) { $metaCrashAt = Get-Date; Save-ArcRiftMetaCrashRecord $metaCrashes; throw 'Meta runtime crashed during Guardian/Dash session (see meta-crash.txt); stopping and restoring.' }
+            }
+            if ($metaLogPath) {
+                $metaNew = Read-AppendedBridgeLog $metaLogPath ([ref]$metaLogOffset)
+                if ($metaNew.Length -gt 0) { $metaLastGrowth = Get-Date }
+                elseif (((Get-Date) - $metaLastGrowth).TotalSeconds -gt 30) {
+                    $metaCrashes = @(Get-ArcRiftNewMetaCrash)
+                    if ($metaCrashes.Count) { $metaCrashAt = Get-Date; Save-ArcRiftMetaCrashRecord $metaCrashes; throw 'Meta runtime crashed during Guardian/Dash session (see meta-crash.txt); stopping and restoring.' }
+                    Save-ArcRiftMetaHangRecord; throw 'Meta runtime stopped responding (its log was silent for 30 s); stopping and restoring.'
+                }
+                foreach ($metaLine in ($metaNew -split "`r?`n")) {
+                    if ($metaLine -match 'Proximity state changed \(1 -> 0\)|Broadcasting HMD unmounted event') {
+                        if (-not $headsetOff) {
+                            $headsetOff = $true; $headsetOffSince = Get-Date; $bridgeLowFpsCount = 0
+                            Write-Output 'Headset off: low-fps check paused until it is worn again. Other guards stay active.'
+                        }
+                    } elseif ($metaLine -match 'Proximity state changed \(0 -> 1\)|Broadcasting HMD mounted event') {
+                        if ($headsetOff) {
+                            $headsetOff = $false; $bridgeFpsPrevTick = $null; $bridgeLowFpsCount = 0
+                            Write-Output 'Headset on: low-fps check resumes.'
+                        }
+                    } elseif ($metaLine -match 'Setting tracking mode to off') {
+                        ('At ' + (Get-Date).ToString('o') + ': Meta paused tracking although ForceSensorTracking is set') | Add-Content (Join-Path $out 'sync-hiccups.txt')
+                        if (-not $trackingPauseWarned) {
+                            $trackingPauseWarned = $true
+                            Write-Output 'Note: Meta paused tracking although ForceSensorTracking is set.'
+                        }
+                    }
+                }
+            }
             # Dash may restart on its own; a crash loop means it does not work on this GPU.
             foreach ($d in @(Get-Process OculusDash -ErrorAction SilentlyContinue)) {
                 if (-not $dashIds.ContainsKey($d.Id)) {
@@ -1069,44 +1224,88 @@ try {
                 'Guardian setup session running. Optical verification is user-reported.' | Out-File (Join-Path $out 'session-ready.txt')
                 $readyWritten = $true
             }
+            # Boost GPU/CPU priority for OVRServer_x64 and OculusDash (same boost as SteamVR manual sessions).
+            if ($readyWritten) {
+                foreach ($bp in @(Get-Process OVRServer_x64,OculusDash -ErrorAction SilentlyContinue)) {
+                    if ($dashBoosted.ContainsKey($bp.Id)) { continue }
+                    $dashBoosted[$bp.Id] = $true
+                    try {
+                        if (-not ('ArcRiftGpuPriority' -as [type])) {
+                            Add-Type -TypeDefinition @'
+using System; using System.Runtime.InteropServices;
+public static class ArcRiftGpuPriority {
+    [DllImport("gdi32.dll")] public static extern int D3DKMTSetProcessSchedulingPriorityClass(IntPtr hProcess, int priority);
+    [DllImport("gdi32.dll")] public static extern int D3DKMTGetProcessSchedulingPriorityClass(IntPtr hProcess, out int priority);
+}
+'@
+                        }
+                        $gpuBefore = -1; $null = [ArcRiftGpuPriority]::D3DKMTGetProcessSchedulingPriorityClass($bp.Handle, [ref]$gpuBefore)
+                        $gpuStatus = 'kept'
+                        if ($gpuBefore -ge 0 -and $gpuBefore -lt 4) { $gpuStatus = 'set HIGH status=0x' + ([ArcRiftGpuPriority]::D3DKMTSetProcessSchedulingPriorityClass($bp.Handle, 4)).ToString('x8') }
+                        $gpuAfter = -1; $null = [ArcRiftGpuPriority]::D3DKMTGetProcessSchedulingPriorityClass($bp.Handle, [ref]$gpuAfter)
+                        $cpuBefore = $bp.PriorityClass
+                        try { if ($bp.PriorityClass -eq 'Normal') { $bp.PriorityClass = 'High' } } catch {}
+                        $boostLine = $bp.Name + ' PID=' + $bp.Id + ' GPU priority ' + $gpuBefore + ' -> ' + $gpuAfter + ' (' + $gpuStatus + '; 2=normal 4=high 5=realtime), CPU ' + $cpuBefore + ' -> ' + $bp.PriorityClass
+                        Write-Output ('Performance boost: ' + $boostLine)
+                        $boostLine | Add-Content (Join-Path $out 'performance-boost.txt')
+                    } catch {}
+                }
+            }
             # Same graphics guards as a normal session.
             $newLog = Read-AppendedBridgeLog (Join-Path $root $bridgeLogName) ([ref]$bridgeLogOffset) -OnlyIfGrown
             $candidateLogTail += $newLog
             if ($candidateLogTail.Length -gt 8192) { $candidateLogTail = $candidateLogTail.Substring($candidateLogTail.Length-8192) }
             if ($candidateLogTail -match '(?i:Renderer failed|Surface failed|Present frame=\d+ result=(?!00000000)[a-f0-9]{8}|Legacy Present health[^\r\n]*slow=1)') { throw 'Headset graphics failure or >100ms presentation stall detected; restoring.' }
-            foreach ($m in [regex]::Matches($newLog,'(?m)^(\d+) Output surface frame=(\d+)')) {
-                $tick=[double]$m.Groups[1].Value; $frame=[double]$m.Groups[2].Value
-                if ($null -ne $bridgeFpsPrevTick -and $frame -gt $bridgeFpsPrevFrame -and $tick -gt $bridgeFpsPrevTick) {
-                    $fps=($frame-$bridgeFpsPrevFrame)*1000.0/($tick-$bridgeFpsPrevTick)
-                    # Stop only below 5 fps (was 45). A 120-frame sample that slow takes over 24 s to arrive.
-                    if ($fps -lt 5) {
-                        $bridgeLowFpsCount++
-                        ('At ' + (Get-Date).ToString('o') + ': headset output ' + [math]::Round($fps,1) + ' fps (low sample ' + $bridgeLowFpsCount + ')') | Add-Content (Join-Path $out 'sync-hiccups.txt')
-                    } else { $bridgeLowFpsCount = 0 }
-                    if ($bridgeLowFpsCount -ge 2) { throw 'Headset output dropped below 5 fps for 2 consecutive samples during Guardian setup; restoring.' }
+            if ($headsetOff -and ((Get-Date) - $headsetOffSince).TotalSeconds -gt 3 -and $newLog -match 'Output surface frame=') {
+                $headsetOff = $false; $bridgeFpsPrevTick = $null; $bridgeLowFpsCount = 0
+            }
+            if (-not $headsetOff) {
+                foreach ($m in [regex]::Matches($newLog,'(?m)^(\d+) Output surface frame=(\d+)')) {
+                    $tick=[double]$m.Groups[1].Value; $frame=[double]$m.Groups[2].Value
+                    if ($null -ne $bridgeFpsPrevTick -and $frame -gt $bridgeFpsPrevFrame -and $tick -gt $bridgeFpsPrevTick) {
+                        $fps=($frame-$bridgeFpsPrevFrame)*1000.0/($tick-$bridgeFpsPrevTick)
+                        # Stop only below 5 fps (was 45). A 120-frame sample that slow takes over 24 s to arrive.
+                        if ($fps -lt 5) {
+                            $bridgeLowFpsCount++
+                            ('At ' + (Get-Date).ToString('o') + ': headset output ' + [math]::Round($fps,1) + ' fps (low sample ' + $bridgeLowFpsCount + ')') | Add-Content (Join-Path $out 'sync-hiccups.txt')
+                        } else { $bridgeLowFpsCount = 0 }
+                        if ($bridgeLowFpsCount -ge 2) { throw 'Headset output dropped below 5 fps for 2 consecutive samples during Guardian setup; restoring.' }
+                    }
+                    $bridgeFpsPrevTick=$tick; $bridgeFpsPrevFrame=$frame
                 }
-                $bridgeFpsPrevTick=$tick; $bridgeFpsPrevFrame=$frame
             }
             if ((Get-Date) -ge $nextEventCheck) {
                 if (@(Get-WinEvent -FilterHashtable @{LogName='System';Id=4101;StartTime=$start} -ErrorAction SilentlyContinue).Count) { throw 'Windows reported a display-driver recovery during Guardian setup.' }
                 $nextEventCheck = (Get-Date).AddSeconds(1)
-                # Meta logs every Guardian change to GuardianBoundary_*.txt; a mode other than "off" with an outline means it is saved.
+                # Meta logs every Guardian change to GuardianBoundary_*.txt. Distinguish an existing boundary loaded at
+                # startup (within the first 5 s) from a new Guardian saved during this session.
                 if (-not $guardianSaved) {
                     $gb = Get-ChildItem $guardianDir -Filter 'GuardianBoundary_*.txt' -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -ge $start } | Sort-Object LastWriteTime -Descending | Select-Object -First 1
                     if ($gb) {
-                        $gbText = Get-Content -LiteralPath $gb.FullName -Raw -ErrorAction SilentlyContinue
-                        if ($gbText -match '"mode"\s*:\s*"(?!off")[a-z_]+"' -and $gbText -match '"outerBoundary"\s*:\s*\[\s*\[') {
-                            $guardianSaved = $true
-                            Copy-Item -LiteralPath $gb.FullName -Destination (Join-Path $out 'guardian-boundary.txt') -ErrorAction SilentlyContinue
-                            'Guardian boundary saved by Meta.' | Set-Content (Join-Path $out 'guardian-saved.txt')
-                            Write-Output 'Guardian saved by Meta. Take the headset off and press Stop & restore. Your next normal session should show the Guardian.'
+                        $gbChanged = ($gb.FullName -ne $guardianBaselineFile) -or ($gb.Length -gt $guardianBaselineLen)
+                        if ($gbChanged) {
+                            $gbText = Get-Content -LiteralPath $gb.FullName -Raw -ErrorAction SilentlyContinue
+                            if ($gbText -match '"mode"\s*:\s*"(?!off")[a-z_]+"' -and $gbText -match '"outerBoundary"\s*:\s*\[\s*\[') {
+                                if (-not $guardianExistingNoted -and ((Get-Date) - $observationStart).TotalSeconds -lt 8) {
+                                    $guardianExistingNoted = $true
+                                    $guardianBaselineFile = $gb.FullName
+                                    $guardianBaselineLen = $gb.Length
+                                    Copy-Item -LiteralPath $gb.FullName -Destination (Join-Path $out 'guardian-boundary-initial.txt') -ErrorAction SilentlyContinue
+                                    Write-Output 'Existing Meta Guardian loaded at startup. You can use Meta Dash / Oculus apps directly, or open Settings > Guardian > Set up Guardian to redraw it.'
+                                } else {
+                                    $guardianSaved = $true
+                                    Copy-Item -LiteralPath $gb.FullName -Destination (Join-Path $out 'guardian-boundary.txt') -ErrorAction SilentlyContinue
+                                    'Guardian boundary saved by Meta.' | Set-Content (Join-Path $out 'guardian-saved.txt')
+                                    Write-Output 'Guardian saved by Meta. You can continue using Dash or take the headset off and press Stop & restore.'
+                                }
+                            }
                         }
                     }
                 }
             }
             Start-Sleep -Milliseconds 250
         }
-        if (-not $guardianSaved) { Write-Output 'Stopped before Meta saved a Guardian.' }
+        if (-not $guardianSaved -and -not $guardianExistingNoted) { Write-Output 'Stopped before Meta saved a Guardian.' }
     } else {
     $clientArgs = '--render'
     if ($Visual) { $clientArgs = '--render-long' }
@@ -1579,11 +1778,17 @@ public static class ArcRiftGpuPriority {
         'Stop and restore source layout.' | Out-File (Join-Path $out 'native-source-stop.txt')
         if (-not $sourceHelper.WaitForExit(6000)) { Stop-Process -Id $sourceHelper.Id -Force -ErrorAction Continue }
         if ($sourceHelper.ExitCode -ne 0) {
-            $failed = $true
-            Write-Output 'Source helper failed; attempting backup restoration before EDID rollback.'
-            if (Test-Path (Join-Path $out 'native-source-backup.bin')) {
-                $restore = Start-Process -FilePath (Join-Path $root 'native_source_test.exe') -ArgumentList '--restore' -WorkingDirectory $out -RedirectStandardOutput (Join-Path $out 'native-source-emergency-restore.txt') -PassThru -Wait
-                if ($restore.ExitCode -ne 0) { Write-Output 'SOURCE RESTORE ERROR: emergency restoration failed.' }
+            if ($edidChanged -or $igclEdidChanged -or $modeChanged) {
+                # Full EDID / mode rollback below restores the display layout cleanly; running --restore while a
+                # temporary EDID is still applied always fails SetDisplayConfig validation (error 31).
+                Write-Output ('Source helper exited with code ' + $sourceHelper.ExitCode + '; skipping source-only restore because full EDID/mode rollback runs next.')
+            } else {
+                $failed = $true
+                Write-Output 'Source helper failed; attempting backup restoration before EDID rollback.'
+                if (Test-Path (Join-Path $out 'native-source-backup.bin')) {
+                    $restore = Start-Process -FilePath (Join-Path $root 'native_source_test.exe') -ArgumentList '--restore' -WorkingDirectory $out -RedirectStandardOutput (Join-Path $out 'native-source-emergency-restore.txt') -WindowStyle Hidden -PassThru -Wait
+                    if ($restore.ExitCode -ne 0) { Write-Output 'SOURCE RESTORE ERROR: emergency restoration failed.' }
+                }
             }
         }
         Get-Content (Join-Path $out 'native-source.txt') -ErrorAction Continue
@@ -1621,11 +1826,7 @@ public static class ArcRiftGpuPriority {
         if ($virtualDisabled) { Enable-PnpDevice -InstanceId 'ROOT\DISPLAY\0000' -Confirm:$false -ErrorAction Continue }
         if ($edidChanged) {
             try {
-                Remove-ItemProperty -LiteralPath $edidKey -Name '0' -ErrorAction SilentlyContinue
-                if (Test-Path -LiteralPath $edidKey) {
-                    $k = Get-Item -LiteralPath $edidKey
-                    if ($k.ValueCount -eq 0 -and $k.SubKeyCount -eq 0) { Remove-Item -LiteralPath $edidKey }
-                }
+                Remove-ArcRiftEdidOverride $edidKey
                 & pnputil.exe /restart-device $monitorInstance
                 if ($LASTEXITCODE -ne 0) {
                     # v5: the Rift S display only exists while Meta's runtime runs; start it, then retry.
@@ -1642,6 +1843,26 @@ public static class ArcRiftGpuPriority {
                 & (Join-Path $root 'display_probe.exe') | Out-File -Encoding utf8 (Join-Path $out 'physical-display-after-rollback.txt')
                 Write-Output 'Original absent EDID override restored; monitor restarted.'
             } catch { $failed = $true; Write-Output ('EDID RESTORE ERROR: ' + $_.Exception.Message) }
+        }
+        if ($igclEdidChanged) {
+            try {
+                $igclExe = Join-Path $root 'arcrift_igcl_edid.exe'
+                $igclUndone = $false
+                & $igclExe --undo 2>&1 | Out-File -Encoding utf8 (Join-Path $out 'igcl-edid-undo.txt')
+                if ($LASTEXITCODE -eq 0) { $igclUndone = $true }
+                if (-not $igclUndone) {
+                    Start-Service OVRService -ErrorAction Continue
+                    for ($i = 0; $i -lt 15 -and -not $igclUndone; $i++) {
+                        Start-Sleep -Seconds 2
+                        & $igclExe --undo 2>&1 | Out-File -Encoding utf8 (Join-Path $out 'igcl-edid-undo.txt')
+                        if ($LASTEXITCODE -eq 0) { $igclUndone = $true }
+                    }
+                }
+                if (-not $igclUndone) { throw 'IGCL driver EDID undo failed during rollback.' }
+                Start-Sleep -Seconds 3
+                & (Join-Path $root 'display_probe.exe') | Out-File -Encoding utf8 (Join-Path $out 'physical-display-after-rollback.txt')
+                Write-Output 'Intel driver-level EDID override (IGCL) removed.'
+            } catch { $failed = $true; Write-Output ('IGCL EDID RESTORE ERROR: ' + $_.Exception.Message) }
         }
         if ($modeChanged) {
             # Rift CV1 (experimental): put the headset display back in the mode Windows has saved for it. If Windows

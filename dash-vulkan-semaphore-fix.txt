@@ -1,0 +1,3 @@
+Opt-in experiment: while this file exists, arc_rift_bridge.dll loads vk-layer\arcrift_vk_layer.dll into processes
+Meta's OVRServer starts (Dash). It hides VK_KHR_external_semaphore_win32 once Dash has created its Vulkan device,
+so Meta's runtime uses its fallback sync instead of KMT semaphores the Arc driver cannot export. Delete to turn off.

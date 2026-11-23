@@ -97,7 +97,7 @@ function Hide-Secrets([string]$Text) {
 }
 
 Add-Line 'ArcRift compatibility report (read-only; nothing on this PC was changed)'
-Add-Line ('Report format 2, ArcRift 1.5, written ' + (Get-Date -Format 'yyyy-MM-dd HH:mm'))
+Add-Line ('Report format 2, ArcRift 1.6, written ' + (Get-Date -Format 'yyyy-MM-dd HH:mm'))
 Add-Line 'Serial numbers are masked. Other monitors are listed by model and mode only. Please still read it before posting.'
 
 # ---------- Windows ----------

@@ -2,12 +2,16 @@
 // Reverse-engineered interface definitions: BnuuySolutions/OculusDirectDisplayAdditions (MIT).
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#include <dxgi1_2.h>
+#include <dxgi1_3.h>
 #include <d3d11.h>
 #include <wrl/client.h>
+#include <algorithm>
 #include <mutex>
 #include <vector>
+#include <string>
 #include <cstdarg>
+#include <share.h>
+#pragma comment(lib, "advapi32.lib") // registry reads for the opt-in Dash Vulkan trace
 #include "ovr_direct_display.h"
 #include "texture_summary.h"
 #include "arcrift_identity.h"
@@ -20,13 +24,16 @@ static const ArcRiftIdentity& Identity() { static const ArcRiftIdentity id = Arc
 static const ArcRiftEdidMode& Mode() { static const ArcRiftEdidMode mode = ArcRiftLoadSessionMode(self); return mode; }
 
 static void Trace(const char* format, ...) {
+    static std::mutex traceLock;
     wchar_t path[MAX_PATH]{};
     GetModuleFileNameW(self, path, MAX_PATH);
     wchar_t* last = wcsrchr(path, L'\\');
     if (!last) return;
     wcscpy_s(last + 1, MAX_PATH - (last + 1 - path), L"arc-rift-bridge.log");
-    FILE* file = nullptr;
-    if (_wfopen_s(&file, path, L"a") != 0) return;
+    std::lock_guard<std::mutex> guard(traceLock);
+    // Shared open (_SH_DENYNO) prevents dropped lines when the session script polls the log or multiple threads log.
+    FILE* file = _wfsopen(path, L"a", _SH_DENYNO);
+    if (!file) return;
     fprintf(file, "%llu ", GetTickCount64());
     va_list args;
     va_start(args, format);
@@ -34,6 +41,18 @@ static void Trace(const char* format, ...) {
     va_end(args);
     fputc('\n', file);
     fclose(file);
+}
+
+// Reads the first pointer field from Meta's Present descriptor without a per-frame ReadProcessMemory kernel syscall.
+static bool ReadFirstPointerSafe(const void* value, void** out) {
+    if (!value || !out) return false;
+    __try {
+        *out = *reinterpret_cast<void* const*>(value);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        *out = nullptr;
+        return false;
+    }
 }
 
 struct PhysicalOutput {
@@ -130,6 +149,7 @@ class Display final : public OVR::IDirectDisplay {
     ComPtr<ID3D11Device> device;
     ComPtr<ID3D11DeviceContext> context;
     ComPtr<IDXGISwapChain1> chain;
+    HANDLE frameWaitable = nullptr;
     HWND window = nullptr;
     UINT width = 0, height = 0;
     unsigned frames = 0;
@@ -183,10 +203,18 @@ class Display final : public OVR::IDirectDisplay {
         wc.lpszClassName = L"ArcRiftExperimentalBridge";
         wc.lpfnWndProc = Proc;
         RegisterClassW(&wc);
-        window = CreateWindowExW(WS_EX_TOPMOST | WS_EX_NOACTIVATE, wc.lpszClassName, L"ArcRift headset display backend",
-            WS_POPUP, output.rect.left, output.rect.top, output.rect.right - output.rect.left,
-            output.rect.bottom - output.rect.top, nullptr, nullptr, self, nullptr);
-        if (!window) return HRESULT_FROM_WIN32(GetLastError());
+        // Ensure exact 1:1 physical pixel placement regardless of Windows DPI scaling on mixed-DPI setups.
+        using SetThreadDpiFn = DPI_AWARENESS_CONTEXT(WINAPI*)(DPI_AWARENESS_CONTEXT);
+        auto setDpi = reinterpret_cast<SetThreadDpiFn>(GetProcAddress(GetModuleHandleW(L"user32.dll"), "SetThreadDpiAwarenessContext"));
+        DPI_AWARENESS_CONTEXT prevDpi = setDpi ? setDpi(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) : nullptr;
+        const LONG rectW = output.rect.right - output.rect.left;
+        const LONG rectH = output.rect.bottom - output.rect.top;
+        window = CreateWindowExW(WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT,
+            wc.lpszClassName, L"ArcRift headset display backend",
+            WS_POPUP, output.rect.left, output.rect.top, rectW, rectH, nullptr, nullptr, self, nullptr);
+        const DWORD winErr = window ? ERROR_SUCCESS : GetLastError();
+        if (setDpi && prevDpi) setDpi(prevDpi);
+        if (!window) return HRESULT_FROM_WIN32(winErr);
         ComPtr<IDXGIFactory2> factory2;
         hr = factory.As(&factory2);
         if (FAILED(hr)) return hr;
@@ -197,11 +225,25 @@ class Display final : public OVR::IDirectDisplay {
         desc.SampleDesc.Count = 1;
         desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
         desc.BufferCount = 2;
-        desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
-        desc.Scaling = DXGI_SCALING_STRETCH;
+        // FLIP_DISCARD + SCALING_NONE (on 1:1 native surface) + waitable latency=1 enables DWM Independent Flip and cuts queued latency.
+        desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+        desc.Scaling = (rectW == LONG(w) && rectH == LONG(h)) ? DXGI_SCALING_NONE : DXGI_SCALING_STRETCH;
         desc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+        desc.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
         hr = factory2->CreateSwapChainForHwnd(device.Get(), window, &desc, nullptr, nullptr, &chain);
+        if (FAILED(hr)) {
+            desc.Flags = 0;
+            desc.Scaling = DXGI_SCALING_STRETCH;
+            hr = factory2->CreateSwapChainForHwnd(device.Get(), window, &desc, nullptr, nullptr, &chain);
+        }
         if (FAILED(hr)) return hr;
+        if (desc.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT) {
+            ComPtr<IDXGISwapChain2> chain2;
+            if (SUCCEEDED(chain.As(&chain2))) {
+                chain2->SetMaximumFrameLatency(1);
+                frameWaitable = chain2->GetFrameLatencyWaitableObject();
+            }
+        }
         factory->MakeWindowAssociation(window, DXGI_MWA_NO_ALT_ENTER);
         width = w;
         height = h;
@@ -223,6 +265,7 @@ class Display final : public OVR::IDirectDisplay {
     }
 public:
     ~Display() override {
+        if (frameWaitable) CloseHandle(frameWaitable);
         for (auto surface : ownedSurfaces) surface->Release();
         if (window) DestroyWindow(window);
     }
@@ -252,6 +295,7 @@ public:
     // releases the display first, then acquires it again. Drop everything tied to the old device so nothing from two
     // devices is ever mixed, then rebuild on the new one. Our references only: Meta keeps its own on old surfaces.
     void ResetRenderer() {
+        if (frameWaitable) { CloseHandle(frameWaitable); frameWaitable = nullptr; }
         chain.Reset();
         if (window && IsWindow(window)) {
             DWORD owner = GetWindowThreadProcessId(window, nullptr);
@@ -336,9 +380,7 @@ public:
         for (auto known : ownedSurfaces) if (value == known) { surface = known; break; }
         if (!surface) {
             void* firstPointer = nullptr;
-            SIZE_T obtained = 0;
-            BOOL read = ReadProcessMemory(GetCurrentProcess(), value, &firstPointer, sizeof(firstPointer), &obtained);
-            if (read && obtained == sizeof(firstPointer)) {
+            if (ReadFirstPointerSafe(value, &firstPointer)) {
                 for (auto known : ownedSurfaces) if (firstPointer == known) { surface = known; break; }
             }
             if (frames == 0 || (!surface && !unknownPresentLogged))
@@ -346,6 +388,7 @@ public:
             if (!surface) { unknownPresentLogged = true; return ovrError_Unsupported; }
         }
         if (frames == 0) Trace("First presented verified surface=%p shared=%p", surface, surface->shared);
+        if (frameWaitable) WaitForSingleObject(frameWaitable, 50);
         ComPtr<ID3D11Texture2D> back;
         HRESULT hr = chain->GetBuffer(0, IID_PPV_ARGS(&back));
         if (FAILED(hr)) return ovrError_Unsupported;
@@ -364,7 +407,7 @@ public:
     ovrResult GetPresentStats(ovrPresentStats* stats) override {
         if (!stats) return ovrError_InvalidParameter;
         memset(stats, 0, sizeof(*stats));
-        stats->RefreshRate = {Mode().valid ? Mode().nominalHz : 80, 1};
+        stats->RefreshRate = {Mode().valid ? int(std::llround(Mode().hz * 1000.0)) : 80000, 1000};
         return ovrSuccess;
     }
     ovrResult GetPresentState(ovrBool* state) override { if (!state) return ovrError_InvalidParameter; *state = ovrFalse; return ovrSuccess; }
@@ -409,8 +452,260 @@ public:
     }
 };
 
+// Experiment (opt-in): Meta's OVRServer decides from a hard-coded list (IsGPUDashVulkanCapable) which GPUs can run
+// Dash on Vulkan: some AMD and NVIDIA device IDs only, Intel always "incapable". When dash-vulkan-flip.txt exists next
+// to this DLL, patch that one decision in OVRServer's memory so it answers "capable". Nothing on disk is changed, and it
+// is applied only when OVRServer's bytes match the build this was read from, so a Meta update turns it off by itself.
+static void ApplyDashVulkanFlip() {
+    wchar_t flag[MAX_PATH]{};
+    GetModuleFileNameW(self, flag, MAX_PATH);
+    wchar_t* last = wcsrchr(flag, L'\\');
+    if (!last) return;
+    wcscpy_s(last + 1, MAX_PATH - (last + 1 - flag), L"dash-vulkan-flip.txt");
+    if (GetFileAttributesW(flag) == INVALID_FILE_ATTRIBUTES) return;
+
+    wchar_t host[MAX_PATH]{};
+    GetModuleFileNameW(nullptr, host, MAX_PATH);
+    const wchar_t* hostName = wcsrchr(host, L'\\');
+    hostName = hostName ? hostName + 1 : host;
+    if (_wcsicmp(hostName, L"OVRServer_x64.exe") != 0) { Trace("DashVulkanFlip: requested, but host is %ls; not patched", hostName); return; }
+
+    // Meta Horizon runtime 208.0.0.84.535: IsGPUDashVulkanCapable starts at RVA 0x166ee0. At RVA 0x166f1f it clears
+    // its answer (xor r13b,r13b) and sets it again only for listed AMD (0x1002) / NVIDIA (0x10de) device IDs; the
+    // function returns r13b. Replacing the clear with "mov r13b,1" makes it answer "capable" for any GPU.
+    static const unsigned char expected[] = {
+        0xC7, 0x44, 0x24, 0x48, 0x00, 0x00, 0x00, 0x00, // mov dword [rsp+48h],0
+        0x45, 0x32, 0xED,                               // xor r13b,r13b   <- patched
+        0x81, 0xF9, 0x02, 0x10, 0x00, 0x00,             // cmp ecx,1002h
+        0x74, 0x35,                                     // je
+        0x81, 0xF9, 0xDE, 0x10, 0x00, 0x00,             // cmp ecx,10DEh
+        0x75, 0x69};                                    // jne
+    static const unsigned char patch[] = {0x41, 0xB5, 0x01}; // mov r13b,1
+    const size_t signatureRva = 0x166f17, patchOffset = 8;
+
+    auto base = reinterpret_cast<unsigned char*>(GetModuleHandleW(nullptr));
+    if (!base) return;
+    auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) { Trace("DashVulkanFlip: unexpected DOS header; not patched"); return; }
+    auto nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) { Trace("DashVulkanFlip: unexpected NT header; not patched"); return; }
+
+    unsigned char* site = nullptr;
+    size_t matchedRva = 0;
+    if (signatureRva + sizeof(expected) <= nt->OptionalHeader.SizeOfImage) {
+        unsigned char* fast = base + signatureRva;
+        if (memcmp(fast, expected, patchOffset) == 0 && memcmp(fast + patchOffset, patch, sizeof(patch)) == 0) {
+            Trace("DashVulkanFlip: already patched at RVA 0x%zx", signatureRva + patchOffset);
+            return;
+        }
+        if (memcmp(fast, expected, sizeof(expected)) == 0) {
+            site = fast;
+            matchedRva = signatureRva;
+        }
+    }
+    // Fallback if a Meta runtime update shifted the RVA: scan executable sections for the exact 27-byte signature,
+    // and only patch if it occurs uniquely in the entire image.
+    if (!site) {
+        const IMAGE_SECTION_HEADER* sec = IMAGE_FIRST_SECTION(nt);
+        size_t matches = 0;
+        for (WORD s = 0; s < nt->FileHeader.NumberOfSections; ++s) {
+            if (!(sec[s].Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
+            const size_t secStart = sec[s].VirtualAddress;
+            const size_t secSize = (std::min)(size_t(sec[s].Misc.VirtualSize), size_t(nt->OptionalHeader.SizeOfImage - secStart));
+            if (secStart >= nt->OptionalHeader.SizeOfImage || secSize < sizeof(expected)) continue;
+            const unsigned char* p = base + secStart;
+            for (size_t off = 0; off + sizeof(expected) <= secSize; ++off) {
+                if (memcmp(p + off, expected, patchOffset) == 0 &&
+                    memcmp(p + off + patchOffset, patch, sizeof(patch)) == 0 &&
+                    memcmp(p + off + patchOffset + sizeof(patch), expected + patchOffset + sizeof(patch), sizeof(expected) - patchOffset - sizeof(patch)) == 0) {
+                    Trace("DashVulkanFlip: already patched at RVA 0x%zx", secStart + off + patchOffset);
+                    return;
+                }
+                if (memcmp(p + off, expected, sizeof(expected)) == 0) {
+                    site = base + secStart + off;
+                    matchedRva = secStart + off;
+                    ++matches;
+                }
+            }
+        }
+        if (matches != 1) {
+            Trace("DashVulkanFlip: OVRServer signature matched %zu times (Meta changed code?); not patched", matches);
+            return;
+        }
+    }
+    DWORD oldProtect = 0;
+    if (!VirtualProtect(site + patchOffset, sizeof(patch), PAGE_EXECUTE_READWRITE, &oldProtect)) {
+        Trace("DashVulkanFlip: VirtualProtect failed %lu; not patched", GetLastError());
+        return;
+    }
+    memcpy(site + patchOffset, patch, sizeof(patch));
+    VirtualProtect(site + patchOffset, sizeof(patch), oldProtect, &oldProtect);
+    FlushInstructionCache(GetCurrentProcess(), site + patchOffset, sizeof(patch));
+    Trace("DashVulkanFlip: patched IsGPUDashVulkanCapable in OVRServer memory (RVA 0x%zx xor r13b,r13b -> mov r13b,1)", matchedRva + patchOffset);
+}
+
+// Experiment (opt-in): Vulkan trace for Meta's Dash. Dash quits with "Failed to configure Rendering Code: -4" inside
+// its own Vulkan setup and logs nothing about why. When dash-vulkan-trace.txt exists next to this DLL, OVRServer's own
+// environment gets the Vulkan SDK's API-dump and validation layers switched on. Dash is launched by OVRServer and
+// inherits that environment, so only Meta's processes are traced: no system-wide variables. Needs the Vulkan SDK.
+// Every Dash launch gets its own log files under vulkan-trace\ (a fixed name would be overwritten by the next launch).
+static std::wstring BesideBridge(const wchar_t* name) {
+    wchar_t path[MAX_PATH]{};
+    GetModuleFileNameW(self, path, MAX_PATH);
+    wchar_t* last = wcsrchr(path, L'\\');
+    if (!last) return L"";
+    last[1] = 0;
+    return std::wstring(path) + name;
+}
+
+static bool FileExists(const std::wstring& path) { return !path.empty() && GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES; }
+
+static std::wstring FindVulkanLayer(const wchar_t* jsonName) {
+    // 1. Explicit layers registered with the Vulkan loader.
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Khronos\\Vulkan\\ExplicitLayers", 0, KEY_READ, &key) == ERROR_SUCCESS) {
+        for (DWORD i = 0;; ++i) {
+            wchar_t name[1024]{};
+            DWORD length = 1024;
+            LONG r = RegEnumValueW(key, i, name, &length, nullptr, nullptr, nullptr, nullptr);
+            if (r == ERROR_NO_MORE_ITEMS) break;
+            if (r != ERROR_SUCCESS) continue;
+            const wchar_t* base = wcsrchr(name, L'\\');
+            if (base && _wcsicmp(base + 1, jsonName) == 0 && FileExists(name)) { RegCloseKey(key); return name; }
+        }
+        RegCloseKey(key);
+    }
+    // 2. <VULKAN_SDK>\Bin. The SDK installer sets VULKAN_SDK; this process may have started before that, so also read
+    //    it from the machine and user environment in the registry.
+    wchar_t sdk[MAX_PATH]{};
+    DWORD size = sizeof(sdk);
+    DWORD n = GetEnvironmentVariableW(L"VULKAN_SDK", sdk, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) {
+        sdk[0] = 0;
+        if (RegGetValueW(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment", L"VULKAN_SDK",
+                RRF_RT_REG_SZ, nullptr, sdk, &size) != ERROR_SUCCESS) {
+            size = sizeof(sdk);
+            if (RegGetValueW(HKEY_CURRENT_USER, L"Environment", L"VULKAN_SDK", RRF_RT_REG_SZ, nullptr, sdk, &size) != ERROR_SUCCESS) sdk[0] = 0;
+        }
+    }
+    if (sdk[0]) {
+        std::wstring path = std::wstring(sdk) + L"\\Bin\\" + jsonName;
+        if (FileExists(path)) return path;
+    }
+    return L"";
+}
+
+static std::wstring traceDirectory;
+
+static DWORD WINAPI RotateVulkanTraceNames(LPVOID) {
+    // Runs for the life of OVRServer (the module is pinned). Each process OVRServer starts copies the names current
+    // at that moment, so launches more than 250 ms apart write separate files.
+    for (;;) {
+        SYSTEMTIME t{};
+        GetLocalTime(&t);
+        wchar_t stamp[32]{};
+        swprintf_s(stamp, L"%02u%02u%02u-%03u", t.wHour, t.wMinute, t.wSecond, t.wMilliseconds);
+        std::wstring validation = traceDirectory + L"\\" + stamp + L"-validation.txt";
+        std::wstring apiDump = traceDirectory + L"\\" + stamp + L"-apidump.txt";
+        SetEnvironmentVariableW(L"VK_KHRONOS_VALIDATION_LOG_FILENAME", validation.c_str());
+        SetEnvironmentVariableW(L"VK_LUNARG_API_DUMP_LOG_FILENAME", apiDump.c_str());
+        SetEnvironmentVariableW(L"VK_APIDUMP_LOG_FILENAME", apiDump.c_str());
+        Sleep(250);
+    }
+}
+
+// Experiment (opt-in): Dash semaphore fix. Meta's library inside Dash exports a GPU semaphore as an old KMT handle
+// whenever the device lists VK_KHR_external_semaphore_win32; the Arc driver lists it but can only export NT handles
+// (tools\vk_layer_test confirms: KMT exportable=0, NT exportable=1), and Dash quits with -4. Without the extension
+// listed, the library uses its own fallback ("[Non-fatal] ... using fallback notification synchronization").
+// When dash-vulkan-semaphore-fix.txt exists, processes OVRServer starts load vk-layer\arcrift_vk_layer.dll, which hides
+// that one extension once the process has created its Vulkan device (source\arcrift_vk_layer.cpp).
+static void ApplyDashVulkanLayers() {
+    const bool fix = FileExists(BesideBridge(L"dash-vulkan-semaphore-fix.txt"));
+    const bool trace = FileExists(BesideBridge(L"dash-vulkan-trace.txt"));
+    if (!fix && !trace) return;
+    wchar_t host[MAX_PATH]{};
+    GetModuleFileNameW(nullptr, host, MAX_PATH);
+    const wchar_t* hostName = wcsrchr(host, L'\\');
+    hostName = hostName ? hostName + 1 : host;
+    if (_wcsicmp(hostName, L"OVRServer_x64.exe") != 0) { Trace("DashVulkanLayers: requested, but host is %ls; not enabled", hostName); return; }
+
+    std::wstring fixLayer, validation, apiDump;
+    if (fix) {
+        fixLayer = BesideBridge(L"vk-layer\\arcrift_vk_layer.json");
+        if (!FileExists(fixLayer) || !FileExists(BesideBridge(L"vk-layer\\arcrift_vk_layer.dll"))) {
+            Trace("DashVulkanFix: vk-layer\\arcrift_vk_layer.json or .dll missing; fix not enabled");
+            fixLayer.clear();
+        }
+    }
+    if (trace) {
+        validation = FindVulkanLayer(L"VkLayer_khronos_validation.json");
+        // The API dump logs every call of every frame: 6.4 GB for a 5-minute Dash run (22 Nov 15:47). Only with its own
+        // opt-in file, dash-vulkan-apidump.txt, next to dash-vulkan-trace.txt.
+        if (FileExists(BesideBridge(L"dash-vulkan-apidump.txt"))) apiDump = FindVulkanLayer(L"VkLayer_api_dump.json");
+        if (validation.empty() && apiDump.empty()) Trace("DashVulkanTrace: Vulkan SDK layers not found (install the Vulkan SDK); trace not enabled");
+    }
+
+    std::wstring layers, layerPaths;
+    auto add = [&](const std::wstring& json, const wchar_t* layerName) {
+        if (json.empty()) return;
+        if (!layers.empty()) layers += L";";
+        layers += layerName;
+        std::wstring dir = json.substr(0, json.find_last_of(L'\\'));
+        if (layerPaths.find(dir) == std::wstring::npos) { if (!layerPaths.empty()) layerPaths += L";"; layerPaths += dir; }
+    };
+    add(apiDump, L"VK_LAYER_LUNARG_api_dump");                // first = closest to Dash: logs what Dash sees
+    add(fixLayer, L"VK_LAYER_ARCRIFT_semaphore_fallback");
+    add(validation, L"VK_LAYER_KHRONOS_validation");
+    if (layers.empty()) return;
+    SetEnvironmentVariableW(L"VK_INSTANCE_LAYERS", layers.c_str());
+    SetEnvironmentVariableW(L"VK_ADD_LAYER_PATH", layerPaths.c_str());
+    if (validation.empty() && apiDump.empty()) {
+        Trace("DashVulkanLayers: enabled for processes OVRServer starts. layers=%ls paths=%ls", layers.c_str(), layerPaths.c_str());
+        return;
+    }
+
+    traceDirectory = BesideBridge(L"vulkan-trace");
+    CreateDirectoryW(traceDirectory.c_str(), nullptr);
+
+    // Fallback settings file with fixed names, for layer versions that ignore the per-launch variables below.
+    std::wstring settings = traceDirectory + L"\\vk_layer_settings.txt";
+    FILE* file = nullptr;
+    if (_wfopen_s(&file, settings.c_str(), L"w") == 0 && file) {
+        fprintf(file, "khronos_validation.debug_action = VK_DBG_LAYER_ACTION_LOG_MSG\n");
+        fprintf(file, "khronos_validation.report_flags = error,warn\n");
+        fprintf(file, "khronos_validation.log_filename = %ls\\fixed-validation.txt\n", traceDirectory.c_str());
+        fprintf(file, "lunarg_api_dump.file = true\n");
+        fprintf(file, "lunarg_api_dump.log_filename = %ls\\fixed-apidump.txt\n", traceDirectory.c_str());
+        fprintf(file, "lunarg_api_dump.output_format = text\n");
+        fprintf(file, "lunarg_api_dump.detailed = true\n");
+        fprintf(file, "lunarg_api_dump.flush = true\n");
+        fclose(file);
+    }
+
+    SetEnvironmentVariableW(L"VK_LAYER_SETTINGS_PATH", settings.c_str());
+    SetEnvironmentVariableW(L"VK_KHRONOS_VALIDATION_DEBUG_ACTION", L"VK_DBG_LAYER_ACTION_LOG_MSG");
+    SetEnvironmentVariableW(L"VK_KHRONOS_VALIDATION_REPORT_FLAGS", L"error;warn");
+    SetEnvironmentVariableW(L"VK_LUNARG_API_DUMP_FILE", L"true");
+    SetEnvironmentVariableW(L"VK_LUNARG_API_DUMP_OUTPUT_FORMAT", L"text");
+    SetEnvironmentVariableW(L"VK_APIDUMP_OUTPUT_FORMAT", L"text");
+    SetEnvironmentVariableW(L"VK_LUNARG_API_DUMP_DETAILED", L"true");
+    SetEnvironmentVariableW(L"VK_LUNARG_API_DUMP_FLUSH", L"true"); // keep output even if Dash is killed
+
+    // The name-rotating thread outlives every caller, so keep this DLL loaded for the life of the process.
+    HMODULE pinned = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+        reinterpret_cast<LPCWSTR>(&ApplyDashVulkanLayers), &pinned);
+    HANDLE thread = CreateThread(nullptr, 0, RotateVulkanTraceNames, nullptr, 0, nullptr);
+    if (thread) CloseHandle(thread);
+    Trace("DashVulkanTrace: enabled for processes OVRServer starts. layers=%ls paths=%ls output=%ls",
+        layers.c_str(), layerPaths.c_str(), traceDirectory.c_str());
+}
+
 OVR_EXPORT ovrResult DirectDisplayInitialize(uint64_t id, OVR::IDirectDisplayAPI** out) {
     Trace("DirectDisplayInitialize requested IID=%llx", id);
+    ApplyDashVulkanFlip();
+    ApplyDashVulkanLayers();
     if (!out) return ovrError_InvalidParameter;
     *out = nullptr;
     if (id != OVR::IID_IDirectDisplayAPI) return ovrError_Unsupported;

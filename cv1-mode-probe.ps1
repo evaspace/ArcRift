@@ -132,6 +132,16 @@ try {
         Write-Host 'Removing the override left behind by an earlier, interrupted run of this test...'
         Remove-Override; $null = Restart-Headset; $null = Wait-Source
     }
+    # A leftover Intel driver-level (IGCL) override from an earlier run that was cut off is not in the registry, so the
+    # check above misses it, and the EDID check below then stops with "not the expected Rift CV1 one". --undo is safe
+    # when there is none (it answers nothingToUndo=1).
+    if ((Test-Path -LiteralPath $igclExe) -and (Test-Path -LiteralPath (Join-Path $root 'arcrift-identity.txt'))) {
+        $undoOut = ((& $igclExe --undo 2>&1 | ForEach-Object { [string]$_ }) -join ' ')
+        if ($undoOut -match 'op=undo ok=1' -and $undoOut -notmatch 'nothingToUndo=1') {
+            Write-Host 'Removed the Intel driver-level EDID override left behind by an earlier, interrupted run of this test...'
+            $null = Restart-Headset; $null = Wait-Source
+        }
+    }
     Remove-Item -LiteralPath $markerPath -ErrorAction SilentlyContinue
     if ($CleanupOnly) { $restoredNote = 'cleanup only'; $exitCode = 0; Write-Host 'Cleanup done.'; return }
 
@@ -192,7 +202,9 @@ try {
         $e[126] = 0
         if ($Change) { & $Change $e }
         # The name carries this run's number, so a description left over from an earlier run cannot pass for this one.
-        $name = 'Rift ' + $Tag + ' ' + $runId
+        # The EDID name field holds only 13 characters: 'Rift hdmi340 NN' (15) was cut to 'Rift hdmi340 ', so the
+        # name read back never matched and every picked-up override was reported as NOT picked up. Keep it short.
+        $name = 'R ' + $Tag + ' ' + $runId
         Set-Name $e $name
         if ($HdmiMaxTmdsMhz -gt 0) { $e = Add-HdmiVsdbBlock $e $HdmiMaxTmdsMhz }
         else { Set-Checksum $e }
@@ -262,7 +274,7 @@ try {
         $source = Wait-Source
         if (-not $source) { Add-Line ('    the headset display did not come back onto the desktop within 25 s (monitor restart result ' + $restart + ')'); continue }
         $state = Get-HeadsetState
-        $r.PickedUp = [bool]($state -and $state.Name -eq $v.Name)
+        $r.PickedUp = [bool]($state -and ([string]$state.Name).Trim() -eq ([string]$v.Name).Trim())
         if ($v.Edid -and -not $r.PickedUp -and (Test-Path -LiteralPath $igclExe)) {
             # Arc B580 fallback: try Intel IGCL driver-level EDID override before asking for an HDMI re-plug.
             # Ensure arcrift-identity.txt matches this CV1 monitor and its Intel parent adapter.
@@ -290,7 +302,7 @@ try {
                     Start-Sleep -Seconds 4
                     $source = Wait-Source 20
                     $state = if ($source) { Get-HeadsetState } else { $null }
-                    $r.PickedUp = [bool]($state -and $state.Name -eq $v.Name)
+                    $r.PickedUp = [bool]($state -and ([string]$state.Name).Trim() -eq ([string]$v.Name).Trim())
                 }
             }
         }
@@ -298,7 +310,7 @@ try {
             Request-Replug ('[' + $v.Tag + '] Windows is still using the previous display description (it shows "' + $(if ($state) { $state.Name }) + '").')
             $source = Wait-Source 40
             $state = if ($source) { Get-HeadsetState } else { $null }
-            $r.PickedUp = [bool]($state -and $state.Name -eq $v.Name)
+            $r.PickedUp = [bool]($state -and ([string]$state.Name).Trim() -eq ([string]$v.Name).Trim())
         }
         if (-not $source) { Add-Line '    the headset display did not come back onto the desktop after re-plugging'; continue }
         if ($v.Edid) { Add-Line ('    override picked up by Windows: ' + $(if ($r.PickedUp) { 'yes' } else { 'NO (Windows shows the name "' + $(if ($state) { $state.Name }) + '")' })) }
@@ -331,7 +343,7 @@ try {
     $restart = Restart-Headset
     $source = Wait-Source
     $afterState = Get-HeadsetState
-    if ($afterState -and $afterState.Name -ne $ownName) {
+    if ($afterState -and ([string]$afterState.Name).Trim() -ne $ownName) {
         Request-Replug ('Putting things back: Windows is still using a test description (it shows "' + $afterState.Name + '").')
         $source = Wait-Source 40
     }
@@ -346,7 +358,7 @@ try {
     if ($overrideGone) { Remove-Item -LiteralPath $markerPath -ErrorAction SilentlyContinue }
     $restoredNote = if ($matched -and $overrideGone) { 'yes: the override is removed and every display matches how it was before the test' } elseif ($overrideGone) { 'the override is removed, but a display differs from before the test (check Windows display settings)' } else { 'NO: the override is still there; run this test again, it removes it first' }
     $afterState = Get-HeadsetState
-    $ownBack = [bool]($afterState -and $afterState.Name -eq $ownName)
+    $ownBack = [bool]($afterState -and ([string]$afterState.Name).Trim() -eq $ownName)
     if (-not $ownBack) { $restoredNote += '. Windows still shows a test description for the headset ("' + $(if ($afterState) { $afterState.Name }) + '"); it has the headset''s own timing and goes away when the headset is re-plugged or the PC restarts' }
     Add-Line ('Everything put back: ' + $restoredNote)
     Add-Line ('HDMI re-plugs asked for: ' + $script:replugs)

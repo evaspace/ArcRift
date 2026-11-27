@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### No spaces in file names
+- Renamed the launchers: `CHECK-MY-PC.cmd`, `CV1-MODE-TEST.cmd`, `START-MANUAL-SESSION.cmd`,
+  `START-META-DASH.cmd`, `STOP-AND-RESTORE.cmd` (were `CHECK MY PC.cmd`, etc.), so they can be typed in
+  PowerShell without quotes. README and script messages updated. ArcRift Control only calls the `.ps1`
+  scripts, so it is unaffected. Naming rules are in `CONTRIBUTING.md`.
+
 ## 1.6 (2026-11-22)
 
 ### Meta Dash & Guardian enabled out of the box

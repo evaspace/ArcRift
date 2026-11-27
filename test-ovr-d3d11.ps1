@@ -180,12 +180,12 @@ function Remove-ArcRiftEdidOverride([string]$KeyPath) {
     $k = Get-Item -LiteralPath $KeyPath
     if ($k.ValueCount -eq 0 -and $k.SubKeyCount -eq 0) { Remove-Item -LiteralPath $KeyPath }
 }
-# Release 1.4 (Rift CV1): the temporary EDID that "CV1 MODE TEST.cmd" found to work on this PC (cv1-override.edid).
+# Release 1.4 (Rift CV1): the temporary EDID that "CV1-MODE-TEST.cmd" found to work on this PC (cv1-override.edid).
 # Accepts 128-byte or 256-byte (with CTA-861 HDMI VSDB extension) overrides that keep this headset's maker, product,
 # serial descriptor, picture size, line/frame layout, and pixel clock within 0.5 %.
 function Get-ArcRiftCv1Override([string]$Path, [byte[]]$Own) {
     $o = [IO.File]::ReadAllBytes($Path)
-    if (-not (Test-ArcRiftEdidChecksum $o)) { throw 'cv1-override.edid is damaged. Delete it and run "CV1 MODE TEST.cmd" again. No changes made.' }
+    if (-not (Test-ArcRiftEdidChecksum $o)) { throw 'cv1-override.edid is damaged. Delete it and run "CV1-MODE-TEST.cmd" again. No changes made.' }
     $ownMode = Get-ArcRiftEdidMode $Own
     $newMode = Get-ArcRiftEdidMode $o
     $sameHeadset = $true
@@ -197,7 +197,7 @@ function Get-ArcRiftCv1Override([string]$Path, [byte[]]$Own) {
         else { for ($i = 0; $i -lt 18; $i++) { if ($o[$newSer + $i] -ne $Own[$ownSer + $i]) { $sameHeadset = $false } } }
     }
     if (-not $sameHeadset -or $newMode.Width -ne $ownMode.Width -or $newMode.Height -ne $ownMode.Height -or $newMode.TotalWidth -ne $ownMode.TotalWidth -or $newMode.TotalHeight -ne $ownMode.TotalHeight -or [math]::Abs($newMode.PixelClock - $ownMode.PixelClock) -gt ($ownMode.PixelClock * 0.005)) {
-        throw 'cv1-override.edid is not for this headset, or changes more than a session allows. Delete it and run "CV1 MODE TEST.cmd" again. No changes made.'
+        throw 'cv1-override.edid is not for this headset, or changes more than a session allows. Delete it and run "CV1-MODE-TEST.cmd" again. No changes made.'
     }
     return ,$o
 }
@@ -749,7 +749,7 @@ try {
     }
     if ((Get-Service OVRService).Status -ne 'Running') { throw 'Service is not in the expected original running state.' }
     if (Get-Process OculusDash -ErrorAction SilentlyContinue) { throw 'Dash is already running; refusing to interrupt an existing session.' }
-    if ((Test-Path -LiteralPath $edidKey) -and (Test-Path -LiteralPath (Join-Path $root 'cv1-probe-active.txt'))) { throw 'A display mode from an interrupted CV1 MODE TEST is still applied to the headset display. Run "CV1 MODE TEST.cmd" again (it removes it first), then start the session; no changes made.' }
+    if ((Test-Path -LiteralPath $edidKey) -and (Test-Path -LiteralPath (Join-Path $root 'cv1-probe-active.txt'))) { throw 'A display mode from an interrupted CV1-MODE-TEST is still applied to the headset display. Run "CV1-MODE-TEST.cmd" again (it removes it first), then start the session; no changes made.' }
     if (Test-Path -LiteralPath $edidKey) { throw 'The headset display mode from an earlier ArcRift session is still applied, but no unrestored session was found to restore it from. Run RECOVER.cmd in the ArcRift folder you used last; no changes made.' }
     # Release 1.1.2: never back up "original" settings over a session that was not restored yet.
     if (Test-Path -LiteralPath $activeSession) { throw 'The previous session was not restored (active-test.xml exists). Run Recover in ArcRift Control or RECOVER.cmd first; no changes made.' }
@@ -783,7 +783,7 @@ try {
         $nativeSignalPattern = [regex]::Escape($nativeSignal)
         # $useTemporaryEdid: this session applies a temporary Windows EDID override ($registryEdid) to the headset
         # display. Always for a Rift S. For a Rift CV1 only when Windows does not offer its mode by itself and
-        # "CV1 MODE TEST.cmd" has found a temporary EDID that makes this graphics driver offer it.
+        # "CV1-MODE-TEST.cmd" has found a temporary EDID that makes this graphics driver offer it.
         $useTemporaryEdid = -not $headsetProfile.OwnEdid
         $registryEdid = $testEdid
         if ($headsetProfile.OwnEdid) {
@@ -824,7 +824,7 @@ try {
                 Write-Output ($headsetProfile.Name + ' (experimental): Windows offers ' + $nativeSize + ' at ' + $modeSwitch.Hz + ' Hz for the headset display' + $(if ($modeSwitch.Needed) { '; the session will switch to it and switch back afterwards.' } else { ' and it is already in use.' }))
             } else {
                 # The graphics driver leaves the headset's mode out (first seen on an Arc B580 over HDMI). If
-                # "CV1 MODE TEST.cmd" found a temporary EDID that makes the driver offer it, use that, the same way a
+                # "CV1-MODE-TEST.cmd" found a temporary EDID that makes the driver offer it, use that, the same way a
                 # Rift S session uses its temporary EDID. Otherwise stop here, before anything is changed.
                 $offeredParsed = @($offeredModes | Where-Object { $_ } | ForEach-Object { $p = $_ -split ' '; [pscustomobject]@{ W = [int]$p[0]; H = [int]$p[1]; Hz = [int]$p[2] } })
                 $sameSize = @($offeredParsed | Where-Object { $_.W -eq $nativeMode.Width -and $_.H -eq $nativeMode.Height } | ForEach-Object { $_.Hz } | Sort-Object -Unique -Descending)
@@ -832,12 +832,12 @@ try {
                 $found = if ($sameSize.Count) { 'it offers ' + $nativeSize + ' only at ' + ($sameSize -join ', ') + ' Hz' } elseif ($largest) { 'the largest mode it offers is ' + $largest.W + 'x' + $largest.H + ' at ' + $largest.Hz + ' Hz' } else { 'it offers no modes' }
                 $overridePath = Join-Path $root 'cv1-override.edid'
                 if (-not (Test-Path -LiteralPath $overridePath)) {
-                    throw ('Windows does not offer the ' + $headsetProfile.Name + ' display mode (' + $nativeSize + ' at ' + $headsetProfile.Hz + ' Hz) on this graphics card, also after restarting the headset monitor: ' + $found + '. The graphics driver leaves the mode out. Next: run "CV1 MODE TEST.cmd" in the ArcRift folder (about 3 minutes). It tries display-mode variants on the headset display only, puts everything back, and saves one that works for the next session. Then send its cv1-mode-test file. If the headset goes through an adapter, plug its ' + $headsetProfile.Cable + ' cable straight into the card first. No changes made.')
+                    throw ('Windows does not offer the ' + $headsetProfile.Name + ' display mode (' + $nativeSize + ' at ' + $headsetProfile.Hz + ' Hz) on this graphics card, also after restarting the headset monitor: ' + $found + '. The graphics driver leaves the mode out. Next: run "CV1-MODE-TEST.cmd" in the ArcRift folder (about 3 minutes). It tries display-mode variants on the headset display only, puts everything back, and saves one that works for the next session. Then send its cv1-mode-test file. If the headset goes through an adapter, plug its ' + $headsetProfile.Cable + ' cable straight into the card first. No changes made.')
                 }
                 $registryEdid = [byte[]](Get-ArcRiftCv1Override $overridePath $testEdid)
                 $useTemporaryEdid = $true
                 $modeSwitch = [pscustomobject]@{ Width = $nativeMode.Width; Height = $nativeMode.Height; Hz = 0; Before = $modeBefore; Needed = $true }
-                Write-Output ($headsetProfile.Name + ' (experimental): Windows does not offer ' + $nativeSize + ' at ' + $headsetProfile.Hz + ' Hz by itself (' + $found + '). Using the temporary display mode that CV1 MODE TEST found (cv1-override.edid); it is removed again afterwards.')
+                Write-Output ($headsetProfile.Name + ' (experimental): Windows does not offer ' + $nativeSize + ' at ' + $headsetProfile.Hz + ' Hz by itself (' + $found + '). Using the temporary display mode that CV1-MODE-TEST found (cv1-override.edid); it is removed again afterwards.')
             }
         }
         [IO.File]::WriteAllBytes((Join-Path $out 'original-monitor.edid'), (Get-ItemProperty -LiteralPath $monitorParent -Name EDID).EDID)
@@ -1020,7 +1020,7 @@ try {
         if ($LASTEXITCODE -ne 0) { throw 'Headset monitor restart failed.' }
         $igclExe = Join-Path $root 'arcrift_igcl_edid.exe'
         if ($headsetProfile.OwnEdid) {
-            # Rift CV1 with the temporary EDID from CV1 MODE TEST. Unlike a Rift S, the headset display keeps its
+            # Rift CV1 with the temporary EDID from CV1-MODE-TEST. Unlike a Rift S, the headset display keeps its
             # identity, so Windows comes back in the mode it has saved for it (1920x1080): wait for the display,
             # check that its own mode is offered now, and switch to it. Temporary, as in the branch above.
             $wantedMode = $null
@@ -1057,7 +1057,7 @@ try {
                     }
                 }
             }
-            if (-not $wantedMode) { throw ('With the temporary display mode from CV1 MODE TEST applied, Windows still does not offer ' + $nativeSize + ' at ' + $headsetProfile.Hz + ' Hz. Run "CV1 MODE TEST.cmd" again and send its report.') }
+            if (-not $wantedMode) { throw ('With the temporary display mode from CV1-MODE-TEST applied, Windows still does not offer ' + $nativeSize + ' at ' + $headsetProfile.Hz + ' Hz. Run "CV1-MODE-TEST.cmd" again and send its report.') }
             $modeSwitch.Hz = $wantedMode.Hz
             if ([ArcRiftDisplayMode]::Current($modeSource) -ne ([string]$modeSwitch.Width + ' ' + $modeSwitch.Height + ' ' + $modeSwitch.Hz)) {
                 ('Switched ' + $modeSource + ' from ' + $modeSwitch.Before + ' to ' + $modeSwitch.Width + ' ' + $modeSwitch.Height + ' ' + $modeSwitch.Hz + ' (width height hertz), temporary, with the temporary EDID applied.') | Set-Content -LiteralPath (Join-Path $out 'headset-mode-switched.txt')
@@ -1065,7 +1065,7 @@ try {
                 $modeResult = [ArcRiftDisplayMode]::Set($modeSource, $modeSwitch.Width, $modeSwitch.Height, $modeSwitch.Hz, $false)
                 if ($modeResult -ne 0) { throw ('Windows refused to switch the headset display to ' + $nativeSize + ' at ' + $modeSwitch.Hz + ' Hz (result ' + $modeResult + ').') }
             }
-            Write-Output ('Headset display switched to ' + $nativeSize + ' at ' + $modeSwitch.Hz + ' Hz with the temporary display mode from CV1 MODE TEST.')
+            Write-Output ('Headset display switched to ' + $nativeSize + ' at ' + $modeSwitch.Hz + ' Hz with the temporary display mode from CV1-MODE-TEST.')
             $nativeFirstWait = 2
         }
         } # end of the temporary EDID branch (Rift S always; Rift CV1 with cv1-override.edid)
@@ -1397,7 +1397,7 @@ public static class ArcRiftGpuPriority {
         [pscustomobject]@{Seconds=$(if ($ManualSession) {0} else {$limit}); ManualSession=[bool]$ManualSession; Started=(Get-Date).ToString('o'); Deadline=$(if ($ManualSession) {$null} else {$deadline.ToString('o')}); HarnessPid=$PID; GameLaunchedByHarness=$false} |
             ConvertTo-Json | Set-Content (Join-Path $out 'vrchat-trial-timing.json')
     }
-    if ($SteamVR) { Write-Output ('SteamVR stop policy: ' + $cutoffLabel + '. Use Stop & restore in ArcRift Control (or STOP AND RESTORE.cmd) for full rollback; do not close this PowerShell window.') }
+    if ($SteamVR) { Write-Output ('SteamVR stop policy: ' + $cutoffLabel + '. Use Stop & restore in ArcRift Control (or STOP-AND-RESTORE.cmd) for full rollback; do not close this PowerShell window.') }
     $steamServerId = $bootstrapServerId
     $steamCompositorId = $bootstrapCompositorId
     $steamReady = $false

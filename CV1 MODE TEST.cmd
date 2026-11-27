@@ -21,7 +21,7 @@ echo Before you continue: headset plugged in (USB, and HDMI straight into the Ar
 echo Meta Horizon app open, no VR session running. Approve the administrator prompt.
 echo.
 pause
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0cv1-mode-probe.ps1"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0cv1-mode-probe.ps1" %*
 echo.
 echo Send the cv1-mode-test-....txt file from this folder (it has no serial numbers).
 pause

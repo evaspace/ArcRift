@@ -13,13 +13,13 @@
 # for a few seconds, to read the signal back. The other variants change the timing and are only listed, never output.
 # If a usable variant works it is saved as cv1-override.edid, which a CV1 session then uses as its temporary EDID.
 # Meta's runtime, SteamVR and all other displays are not touched. Needs administrator rights.
-param([switch]$CleanupOnly)
+param([switch]$CleanupOnly, [string[]]$Only)
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
 $started = Get-Date
 $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    $elevatedArgs = '-NoProfile -ExecutionPolicy Bypass -File "' + $PSCommandPath + '"' + $(if ($CleanupOnly) { ' -CleanupOnly' } else { '' })
+    $elevatedArgs = '-NoProfile -ExecutionPolicy Bypass -File "' + $PSCommandPath + '"' + $(if ($CleanupOnly) { ' -CleanupOnly' } else { '' }) + $(if ($Only) { ' -Only ' + (($Only -join ',') -replace '[^A-Za-z0-9,]', '') } else { '' })
     try { $child = Start-Process powershell.exe -Verb RunAs -ArgumentList $elevatedArgs -PassThru }
     catch { Write-Output 'Administrator approval is needed (the test restarts the headset monitor device). Nothing was changed.'; exit 1 }
     $null = $child.Handle; $child.WaitForExit()
@@ -149,7 +149,7 @@ try {
     # Windows keeps the EDID it last read in the registry. On an Arc B580 a monitor restart does not make it read the
     # headset again, so after a cut-off run that value can still be one of this test's own variants (name 'R <tag> NN'
     # or, before the name fix, 'Rift <tag> '). Then only an HDMI re-plug refreshes it: ask for one instead of stopping.
-    $testTags = 'hdmi340|hdmi300|own|c297|rb|hb100|hb120|hb160|vb35|60hz|59rb'
+    $testTags = 'hdmi340|hdmi300|own|c297|rb|hb100|hb120|hb128|hb136|hb144|hb152|hb160|hb160f8|vb35|60hz|59rb'
     for ($attempt = 1; ; $attempt++) {
         $own = [byte[]](Get-ItemProperty -LiteralPath $params -Name EDID -ErrorAction Stop).EDID
         if (-not $own -or $own.Length -lt 128) { throw 'Windows has no EDID stored for the headset display. Nothing was changed.' }
@@ -264,7 +264,22 @@ try {
         (New-Variant 'vb35' 'own 80 blank columns, ordinary 35 blank lines, 248.98 MHz, 90 Hz' $false 90 { param($e) Set-Timing $e 24898 80 35 8 32 3 10 })
         (New-Variant '60hz' 'own layout at 60 Hz, 197.84 MHz' $false 60 { param($e) Set-Timing $e 19784 80 272 8 32 50 2 })
         (New-Variant '59rb' 'short blanking at 59 Hz, 163.22 MHz (under the 165 MHz limit of simple adapters and DVI)' $false 59 { param($e) Set-Timing $e 16322 80 35 8 32 3 10 })
+        # Second B580 run (27 Nov): hb100 and hb120 refused, hb160 offered. These narrow the minimum down; the CV1's
+        # own front porch (8) and sync (32) are kept so only the back porch grows. 'hb160f8' is hb160 with that same
+        # porch, to check whether the porch split matters (hb160 used front 48).
+        (New-Variant 'hb128' 'own 272 blank lines, 128 blank columns, 303.11 MHz + HDMI VSDB 340 MHz, 90 Hz' $false 90 { param($e) Set-Timing $e 30311 128 272 8 32 50 2 } 340)
+        (New-Variant 'hb136' 'own 272 blank lines, 136 blank columns, 304.17 MHz + HDMI VSDB 340 MHz, 90 Hz' $false 90 { param($e) Set-Timing $e 30417 136 272 8 32 50 2 } 340)
+        (New-Variant 'hb144' 'own 272 blank lines, 144 blank columns, 305.23 MHz + HDMI VSDB 340 MHz, 90 Hz' $false 90 { param($e) Set-Timing $e 30523 144 272 8 32 50 2 } 340)
+        (New-Variant 'hb152' 'own 272 blank lines, 152 blank columns, 306.29 MHz + HDMI VSDB 340 MHz, 90 Hz' $false 90 { param($e) Set-Timing $e 30629 152 272 8 32 50 2 } 340)
+        (New-Variant 'hb160f8' 'as hb160 but the CV1''s own front porch 8 / sync 32, 307.35 MHz + HDMI VSDB 340 MHz, 90 Hz' $false 90 { param($e) Set-Timing $e 30735 160 272 8 32 50 2 } 340)
     )
+    # -Only hb128,hb136 runs just those variants (fewer HDMI re-plugs). Unknown names stop the test before any change.
+    if ($Only) {
+        $wanted = @($Only | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+        $unknown = @($wanted | Where-Object { $_ -notin $variants.Tag })
+        if ($unknown.Count) { throw ('Unknown variant(s) for -Only: ' + ($unknown -join ', ') + '. Known: ' + ($variants.Tag -join ', ') + '. Nothing was changed.') }
+        $variants = @($variants | Where-Object { $_.Tag -in $wanted })
+    }
 
     Add-Line 'ArcRift Rift CV1 display-mode test'
     Add-Line ('Report format 2, ArcRift 1.6, written ' + (Get-Date -Format 'yyyy-MM-dd HH:mm') + '. No serial numbers are in this file.')

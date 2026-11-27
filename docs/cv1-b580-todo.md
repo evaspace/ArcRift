@@ -41,7 +41,15 @@ CV1 native timing: 2160x1200 active, **80** blank columns (front 8, sync 32), **
 
 **Conclusion so far:** the driver needs a horizontal blank somewhere between **121 and 160** pixels. The pixel clock,
 the 300/340 MHz limits, the HDMI VSDB and the vertical blank do **not** matter. `hb160` keeps the CV1's own 272
-blank lines, so it is the closest accepted mode to the panel's native timing.
+blank lines, so it is the closest accepted mode to the panel's native timing. Its clock was scaled with the line
+length, so the **line rate (132.48 kHz) and frame rate (90 Hz) are exactly the CV1's**: only the share of each line
+that is blank grows (80 → 160 of 2240 → 2320 pixels).
+
+**Where the limit comes from (research, 27 Nov):** Intel's Linux display code (shared by i915 and xe, used for DG2 and
+BMG) only requires `htotal - hdisplay >= 32` (`intel_cpu_transcoder_mode_valid()` in `intel_display.c`), and has no
+HDMI- or audio-related hblank check. So the CV1's 80 columns are fine for the hardware; the 160 floor is most likely
+a fixed rule of the **Windows** driver. 160 is exactly the horizontal blank of VESA CVT reduced blanking v1, which
+fits a "CVT-RB minimum" policy (inference, not documented).
 
 ## Ideas ruled out
 - **Bad cable / HDMI 1.4 clock cap** — 163 MHz with 80 columns is refused too; 307 MHz with 160 columns is fine.
@@ -60,22 +68,33 @@ blank lines, so it is the closest accepted mode to the panel's native timing.
 - Launchers renamed without spaces (`CV1-MODE-TEST.cmd`, …).
 
 ## To test next
-1. [ ] **Find the exact minimum horizontal blank:** variants hb128, hb136, hb144, hb152 (keep 272 lines).
-       Smaller = closer to the panel's native line timing.
-2. [ ] **Does the limit come from HDMI audio / data islands?** Try 80 columns with a CTA-861 block that declares
-       **no audio** (and/or plain DVI without a CTA block, already refused as `own`): depends on what Intel's
-       display code requires (research running).
+1. [ ] **Find the exact minimum horizontal blank:** `CV1-MODE-TEST.cmd -Only hb128,hb136,hb144,hb152,hb160f8`
+       (variants ready in the fork). Smaller = closer to the panel's native line timing. If only 160 passes, it is a
+       fixed CVT-RB-style floor.
+2. [ ] **Output test on the headset** (see 3 below) — the real unknown is whether the CV1's HDMI-to-display bridge
+       accepts 160 blank columns.
 3. [ ] **Output test on the headset:** switch the CV1 to `hb160` (2320x1472 total, 307.35 MHz) for a few seconds and
        look inside: picture, black, or flicker? Needs a probe mode that outputs a non-native variant, and the session
        check in `test-ovr-d3d11.ps1` (`Get-ArcRiftCv1Override`: same totals, clock ±0.5 %) relaxed behind an opt-in.
 4. [ ] **Desktop view in VR:** once the panel shows a picture, start `START-META-DASH.cmd` and open the desktop in
        Dash.
 5. [ ] **SteamVR session** with a simple game.
-6. [ ] **Linux route (same PC, dual boot):** Monado + OpenHMD Rift CV1 driver on Mesa/xe, where modes can be forced
-       with a modeline. Check whether the Linux Intel driver has the same blanking limit.
+6. [ ] **Linux route (same PC, dual boot) — promising:** the Linux Intel driver accepts the CV1's native timing
+       (hblank floor 32, see above). Test Monado + OpenHMD Rift CV1 driver on Mesa/xe; first just check that the
+       native 2160x1200@90 mode is offered (`xrandr` / `drm_info`, the CV1 is a "non-desktop" display there).
 7. [ ] Check that **Resizable BAR** is enabled in the BIOS (Arc performance).
 
 ## Ideas not tested
+- **hblank 160 at a lower clock:** keep htotal 2320 and shrink the vertical blank so the clock stays at ~297 MHz
+  (e.g. vtotal 1429 at 89.5 Hz). Only worth it if the panel wants the native clock rather than the native line rate.
+- **Sync placement inside the 160 blank columns** (front porch / sync width / polarity), in case the panel's bridge is
+  fussy about it (`hb160` vs `hb160f8` is a first check).
+- **Enable Intel IGCL EDID management:** per intel/drivers.gpu.control-library issue #88 it is off by default and turned
+  on with the DWORD `EdidMgmtEnable=1` in the display adapter's driver registry key, then a reboot (side effect:
+  multi-plane overlay disabled). Intel later called the API restricted/NDA (issues #110, #127). A driver-registry
+  change the user must apply themselves; low priority since the Windows override already works.
+- **CTA block without audio / with an HDMI Forum VSDB** — low priority: a plain DVI EDID (`own`) was refused too, and
+  the Linux code shows no audio-related hblank rule.
 - DisplayPort → HDMI active adapter (the CV1 is HDMI only; would change which link limits apply).
 - Older/newer Intel drivers (the A770 that works runs 32.0.101.9150).
 - CRU (Custom Resolution Utility) instead of the script: same registry mechanism, unlikely to differ.

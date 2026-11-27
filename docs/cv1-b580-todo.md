@@ -71,8 +71,14 @@ fits a "CVT-RB minimum" policy (inference, not documented).
 1. [ ] **Find the exact minimum horizontal blank:** `CV1-MODE-TEST.cmd -Only hb128,hb136,hb144,hb152,hb160f8`
        (variants ready in the fork). Smaller = closer to the panel's native line timing. If only 160 passes, it is a
        fixed CVT-RB-style floor.
-2. [ ] **Output test on the headset** (see 3 below) — the real unknown is whether the CV1's HDMI-to-display bridge
-       accepts 160 blank columns.
+2. [ ] **Look test on the headset:** `CV1-MODE-TEST.cmd -Only hb160c,hb160 -Look` puts each accepted variant on the
+       headset for up to a minute and asks what you see. `hb160c` keeps the CV1's exact 296.75 MHz (221 blank lines);
+       `hb160` keeps its 272 blank lines but needs 307.35 MHz. The CV1's HDMI-to-display bridge is a Toshiba
+       TC358870 (iFixit teardown); a source says the panel stays dark when the pixel clock is not exactly right, and
+       "accepts some other blanking" (values not given).
+       **If both are black:** the CV1 screen is only switched on by a USB command (normally Meta's service sends it).
+       Retry with the Meta Horizon app open and the headset worn; or try OhioIon/riftDriverWin, a small open-source
+       tool that switches the CV1 screen on and keeps it on without Meta's software (third-party program: user's call).
 3. [ ] **Output test on the headset:** switch the CV1 to `hb160` (2320x1472 total, 307.35 MHz) for a few seconds and
        look inside: picture, black, or flicker? Needs a probe mode that outputs a non-native variant, and the session
        check in `test-ovr-d3d11.ps1` (`Get-ArcRiftCv1Override`: same totals, clock ±0.5 %) relaxed behind an opt-in.
@@ -80,11 +86,18 @@ fits a "CVT-RB minimum" policy (inference, not documented).
        Dash.
 5. [ ] **SteamVR session** with a simple game.
 6. [ ] **Linux route (same PC, dual boot) — promising:** the Linux Intel driver accepts the CV1's native timing
-       (hblank floor 32, see above). Test Monado + OpenHMD Rift CV1 driver on Mesa/xe; first just check that the
-       native 2160x1200@90 mode is offered (`xrandr` / `drm_info`, the CV1 is a "non-desktop" display there).
+       (hblank floor 32, see above), and the kernel marks OVR0004 as a non-desktop (VR) display. Candidates:
+       AIIX/RiftLinux (Monado fork for the CV1, SteamVR/OpenXR, tested on NVIDIA only) and
+       MaySeikatsu/monado-rift-wayland (thaytan's OpenHMD Rift tracking, DRM-lease direct mode). Unverified claim
+       (vronlinux.org): wired headsets lack direct mode on Intel's Linux driver; then fall back to an extended display
+       with a forced `video=` mode (Fredrum/riftOnLinux, OhioIon/riftDriverPi do this on a Raspberry Pi).
+       First step: boot Linux and check whether 2160x1200@90 is offered for the CV1 (`drm_info` / `xrandr`).
 7. [ ] Check that **Resizable BAR** is enabled in the BIOS (Arc performance).
 
 ## Ideas not tested
+- **Same 80 blank columns, different split** (front porch / sync / back porch): in case the Windows rule is about one
+  part (e.g. back porch) rather than the total. Native split is 8 / 32 / 40 (OhioIon/riftDriverPi modeline).
+- **DisplayPort output + active DP-to-HDMI adapter:** a different encoder path in the driver, maybe with other limits.
 - **hblank 160 at a lower clock:** keep htotal 2320 and shrink the vertical blank so the clock stays at ~297 MHz
   (e.g. vtotal 1429 at 89.5 Hz). Only worth it if the panel wants the native clock rather than the native line rate.
 - **Sync placement inside the 160 blank columns** (front porch / sync width / polarity), in case the panel's bridge is
@@ -98,6 +111,13 @@ fits a "CVT-RB minimum" policy (inference, not documented).
 - DisplayPort → HDMI active adapter (the CV1 is HDMI only; would change which link limits apply).
 - Older/newer Intel drivers (the A770 that works runs 32.0.101.9150).
 - CRU (Custom Resolution Utility) instead of the script: same registry mechanism, unlikely to differ.
+
+## Related projects (research, 27 Nov)
+No other project runs a Rift on Arc under Windows; Intel's official answer is that VR is unsupported on A/B series.
+- OhioIon/riftDriverWin, riftDriverPi — switch the CV1 screen on over USB HID without Meta software; native modeline.
+- Fredrum/riftOnLinux — CV1 on a Raspberry Pi via a modified EDID (`drm.edid_firmware=`) and a forced mode.
+- AIIX/RiftLinux, MaySeikatsu/monado-rift-wayland, thaytan/OpenHMD (`rift-kalman-filter`) — CV1 on Linux.
+- DealsBeam/ArcRift — old fork of upstream 1.1.1, nothing for the CV1.
 
 ## Community report (draft for issue #1 on funrun45/ArcRift — not posted)
 > GPU: Arc B580 (Sparkle Titan) · Driver: 32.0.101.9175 · Headset: **Rift CV1** (HDMI direct) · Windows 11 25H2

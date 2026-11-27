@@ -137,6 +137,7 @@ try {
     # when there is none (it answers nothingToUndo=1).
     if ((Test-Path -LiteralPath $igclExe) -and (Test-Path -LiteralPath (Join-Path $root 'arcrift-identity.txt'))) {
         $undoOut = ((& $igclExe --undo 2>&1 | ForEach-Object { [string]$_ }) -join ' ')
+        Add-Line ('Leftover Intel driver-level override check: ' + $undoOut)
         if ($undoOut -match 'op=undo ok=1' -and $undoOut -notmatch 'nothingToUndo=1') {
             Write-Host 'Removed the Intel driver-level EDID override left behind by an earlier, interrupted run of this test...'
             $null = Restart-Headset; $null = Wait-Source
@@ -145,13 +146,31 @@ try {
     Remove-Item -LiteralPath $markerPath -ErrorAction SilentlyContinue
     if ($CleanupOnly) { $restoredNote = 'cleanup only'; $exitCode = 0; Write-Host 'Cleanup done.'; return }
 
-    $own = [byte[]](Get-ItemProperty -LiteralPath $params -Name EDID -ErrorAction Stop).EDID
-    if (-not $own -or $own.Length -lt 128) { throw 'Windows has no EDID stored for the headset display. Nothing was changed.' }
-    $base = [byte[]]::new(128); [Array]::Copy($own, $base, 128)
-    $sum = 0; foreach ($b in $base) { $sum += $b }
-    $ownW = [int]$base[56] + (([int]$base[58] -band 0xF0) -shl 4); $ownH = [int]$base[59] + (([int]$base[61] -band 0xF0) -shl 4)
-    $ownClock = ([int]$base[54] + 256 * [int]$base[55]) * 10000
-    if (($sum % 256) -ne 0 -or $base[8] -ne 0x3e -or $base[9] -ne 0xd2 -or $ownW -ne 2160 -or $ownH -ne 1200 -or $ownClock -ne 296750000) { throw ('The headset display''s EDID is not the expected Rift CV1 one (found ' + $ownW + 'x' + $ownH + ', pixel clock ' + $ownClock + '). Nothing was changed.') }
+    # Windows keeps the EDID it last read in the registry. On an Arc B580 a monitor restart does not make it read the
+    # headset again, so after a cut-off run that value can still be one of this test's own variants (name 'R <tag> NN'
+    # or, before the name fix, 'Rift <tag> '). Then only an HDMI re-plug refreshes it: ask for one instead of stopping.
+    $testTags = 'hdmi340|hdmi300|own|c297|rb|60hz|59rb'
+    for ($attempt = 1; ; $attempt++) {
+        $own = [byte[]](Get-ItemProperty -LiteralPath $params -Name EDID -ErrorAction Stop).EDID
+        if (-not $own -or $own.Length -lt 128) { throw 'Windows has no EDID stored for the headset display. Nothing was changed.' }
+        $base = [byte[]]::new(128); [Array]::Copy($own, $base, 128)
+        $sum = 0; foreach ($b in $base) { $sum += $b }
+        $ownW = [int]$base[56] + (([int]$base[58] -band 0xF0) -shl 4); $ownH = [int]$base[59] + (([int]$base[61] -band 0xF0) -shl 4)
+        $ownClock = ([int]$base[54] + 256 * [int]$base[55]) * 10000
+        $storedName = ''
+        foreach ($o in 72, 90, 108) { if ($base[$o] -eq 0 -and $base[$o + 1] -eq 0 -and $base[$o + 3] -eq 0xFC) { $storedName = ([Text.Encoding]::ASCII.GetString($base, $o + 5, 13) -replace '[\x00-\x1f]', '').Trim() } }
+        $isCv1 = (($sum % 256) -eq 0 -and $base[8] -eq 0x3e -and $base[9] -eq 0xd2 -and $ownW -eq 2160 -and $ownH -eq 1200 -and $ownClock -eq 296750000)
+        if ($isCv1) { break }
+        $isOurs = $storedName -match ('^(R|Rift) (' + $testTags + ')\b')
+        if (-not $isOurs -or $attempt -gt 3) { throw ('The headset display''s EDID is not the expected Rift CV1 one (found ' + $ownW + 'x' + $ownH + ', pixel clock ' + $ownClock + ', name "' + $storedName + '"). Nothing was changed.') }
+        Add-Line ('Windows still has a description from an earlier run of this test (name "' + $storedName + '"); asking for an HDMI re-plug (' + $attempt + '/3).')
+        Write-Host ''
+        Write-Host '>>> Windows still remembers a test display description from an earlier, interrupted run.'
+        Write-Host '>>> Unplug the headset''s HDMI cable from the graphics card, wait 3 seconds, plug it back in.'
+        $null = Read-Host '>>> Then press Enter here'
+        Start-Sleep -Seconds 5
+        $null = Wait-Source 40
+    }
 
     # ---- the EDID variants ----
     function Set-Checksum([byte[]]$e) {

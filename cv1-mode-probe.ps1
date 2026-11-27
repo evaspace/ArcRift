@@ -13,13 +13,13 @@
 # for a few seconds, to read the signal back. The other variants change the timing and are only listed, never output.
 # If a usable variant works it is saved as cv1-override.edid, which a CV1 session then uses as its temporary EDID.
 # Meta's runtime, SteamVR and all other displays are not touched. Needs administrator rights.
-param([switch]$CleanupOnly, [string[]]$Only)
+param([switch]$CleanupOnly, [string[]]$Only, [switch]$Look)
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
 $started = Get-Date
 $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    $elevatedArgs = '-NoProfile -ExecutionPolicy Bypass -File "' + $PSCommandPath + '"' + $(if ($CleanupOnly) { ' -CleanupOnly' } else { '' }) + $(if ($Only) { ' -Only ' + (($Only -join ',') -replace '[^A-Za-z0-9,]', '') } else { '' })
+    $elevatedArgs = '-NoProfile -ExecutionPolicy Bypass -File "' + $PSCommandPath + '"' + $(if ($CleanupOnly) { ' -CleanupOnly' } else { '' }) + $(if ($Only) { ' -Only ' + (($Only -join ',') -replace '[^A-Za-z0-9,]', '') } else { '' }) + $(if ($Look) { ' -Look' } else { '' })
     try { $child = Start-Process powershell.exe -Verb RunAs -ArgumentList $elevatedArgs -PassThru }
     catch { Write-Output 'Administrator approval is needed (the test restarts the headset monitor device). Nothing was changed.'; exit 1 }
     $null = $child.Handle; $child.WaitForExit()
@@ -378,7 +378,33 @@ try {
         $r.Offered = $true
         $r.Test = [ArcRiftDisplayMode]::Set($source, 2160, 1200, [int]$pick[0], $true)
         Add-Line ('    2160x1200: OFFERED at ' + $r.OfferedHz + ' Hz; test of ' + $pick[0] + ' Hz: ' + $(if ($r.Test -eq 0) { 'accepted' } else { 'refused (result ' + $r.Test + ')' }))
-        if (-not $v.Usable -or $r.Test -ne 0) { continue }
+        if ($r.Test -ne 0) { continue }
+        if (-not $v.Usable) {
+            # -Look: switch a variant the driver accepts but a session cannot use yet (it changes the line layout, e.g.
+            # hb160) onto the headset for up to a minute so the tester can look inside. Only a look test: nothing is
+            # saved as cv1-override.edid, and the saved mode comes back right after.
+            if ($Look) {
+                $set = [ArcRiftDisplayMode]::Set($source, 2160, 1200, [int]$pick[0], $false)
+                Start-Sleep -Seconds 3
+                $live = Get-HeadsetState
+                $sig = if ($live) { $live.Size + ' total ' + $live.Total + ' clock ' + $live.Clock + ' at ' + $live.Hz + ' Hz' } else { 'not readable' }
+                Write-Host ''
+                Write-Host ('>>> [' + $v.Tag + '] is now ON on the headset (signal ' + $sig + ').')
+                Write-Host '>>> Put the headset on (or cover the sensor between the lenses) and look inside.'
+                Write-Host '>>> You may see the Windows desktop/wallpaper there, or move the mouse off the right/left edge of your screen.'
+                $deadline = (Get-Date).AddSeconds(60)
+                $seen = ''
+                while (-not $seen -and (Get-Date) -lt $deadline) {
+                    $a = (Read-Host '>>> What do you see? p = a picture, b = black/nothing, g = garbage/flicker/colours').Trim().ToLowerInvariant()
+                    if ($a -in 'p', 'b', 'g') { $seen = $a }
+                }
+                $null = [ArcRiftDisplayMode]::Restore($source)
+                Start-Sleep -Seconds 2
+                $seenText = switch ($seen) { 'p' { 'PICTURE' } 'b' { 'black / nothing' } 'g' { 'garbage / flicker' } default { 'no answer' } }
+                Add-Line ('    look test (result ' + $set + '): signal ' + $sig + '; tester saw: ' + $seenText)
+            }
+            continue
+        }
         # A usable variant: switch it on for a few seconds and read the signal back, then return to the saved mode.
         $set = [ArcRiftDisplayMode]::Set($source, 2160, 1200, [int]$pick[0], $false)
         Start-Sleep -Seconds 3

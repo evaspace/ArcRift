@@ -149,7 +149,7 @@ try {
     # Windows keeps the EDID it last read in the registry. On an Arc B580 a monitor restart does not make it read the
     # headset again, so after a cut-off run that value can still be one of this test's own variants (name 'R <tag> NN'
     # or, before the name fix, 'Rift <tag> '). Then only an HDMI re-plug refreshes it: ask for one instead of stopping.
-    $testTags = 'hdmi340|hdmi300|own|c297|rb|hb100|hb120|hb128|hb136|hb144|hb152|hb160|hb160f8|vb35|60hz|59rb'
+    $testTags = 'hdmi340|hdmi300|own|c297|rb|hb100|hb120|hb128|hb136|hb144|hb152|hb160|hb160f8|hb160c|vb35|60hz|59rb'
     for ($attempt = 1; ; $attempt++) {
         $own = [byte[]](Get-ItemProperty -LiteralPath $params -Name EDID -ErrorAction Stop).EDID
         if (-not $own -or $own.Length -lt 128) { throw 'Windows has no EDID stored for the headset display. Nothing was changed.' }
@@ -272,6 +272,10 @@ try {
         (New-Variant 'hb144' 'own 272 blank lines, 144 blank columns, 305.23 MHz + HDMI VSDB 340 MHz, 90 Hz' $false 90 { param($e) Set-Timing $e 30523 144 272 8 32 50 2 } 340)
         (New-Variant 'hb152' 'own 272 blank lines, 152 blank columns, 306.29 MHz + HDMI VSDB 340 MHz, 90 Hz' $false 90 { param($e) Set-Timing $e 30629 152 272 8 32 50 2 } 340)
         (New-Variant 'hb160f8' 'as hb160 but the CV1''s own front porch 8 / sync 32, 307.35 MHz + HDMI VSDB 340 MHz, 90 Hz' $false 90 { param($e) Set-Timing $e 30735 160 272 8 32 50 2 } 340)
+        # hb160 needs 307.35 MHz; the CV1's HDMI-to-display bridge (Toshiba TC358870) may not like more than its own
+        # 296.75 MHz. hb160c keeps that exact clock and the 160 blank columns, and shortens the vertical blank instead
+        # (221 lines, 90.02 Hz).
+        (New-Variant 'hb160c' '160 blank columns at the CV1''s own 296.75 MHz, 221 blank lines, 90.02 Hz + HDMI VSDB 340 MHz' $false 90 { param($e) Set-Timing $e 29675 160 221 48 32 50 2 } 340)
     )
     # -Only hb128,hb136 runs just those variants (fewer HDMI re-plugs). Unknown names stop the test before any change.
     if ($Only) {

@@ -149,7 +149,7 @@ try {
     # Windows keeps the EDID it last read in the registry. On an Arc B580 a monitor restart does not make it read the
     # headset again, so after a cut-off run that value can still be one of this test's own variants (name 'R <tag> NN'
     # or, before the name fix, 'Rift <tag> '). Then only an HDMI re-plug refreshes it: ask for one instead of stopping.
-    $testTags = 'hdmi340|hdmi300|own|c297|rb|60hz|59rb'
+    $testTags = 'hdmi340|hdmi300|own|c297|rb|hb160|vb35|60hz|59rb'
     for ($attempt = 1; ; $attempt++) {
         $own = [byte[]](Get-ItemProperty -LiteralPath $params -Name EDID -ErrorAction Stop).EDID
         if (-not $own -or $own.Length -lt 128) { throw 'Windows has no EDID stored for the headset display. Nothing was changed.' }
@@ -254,6 +254,10 @@ try {
         (New-Variant 'own' 'the headset''s own EDID again, 128-byte base block only (control: is an override picked up at all?)' $true 90 $null)
         (New-Variant 'c297' 'same picture and layout, pixel clock 297.00 MHz instead of 296.75 (a standard HDMI clock; 90.07 Hz)' $true 90 { param($e) Set-Timing $e 29700 80 272 8 32 50 2 })
         (New-Variant 'rb' 'ordinary monitor blanking (160 columns, 35 lines), 257.87 MHz, 90 Hz' $false 90 { param($e) Set-Timing $e 25787 160 35 48 32 3 10 })
+        # 'rb' changes both blanking intervals at once. These two change one each, to find which one the driver refuses:
+        # the CV1's own 272 blank lines with ordinary 160 blank columns, and the CV1's own 80 columns with 35 lines.
+        (New-Variant 'hb160' 'own 272 blank lines, ordinary 160 blank columns, 307.35 MHz + HDMI VSDB 340 MHz, 90 Hz' $false 90 { param($e) Set-Timing $e 30735 160 272 48 32 50 2 } 340)
+        (New-Variant 'vb35' 'own 80 blank columns, ordinary 35 blank lines, 248.98 MHz, 90 Hz' $false 90 { param($e) Set-Timing $e 24898 80 35 8 32 3 10 })
         (New-Variant '60hz' 'own layout at 60 Hz, 197.84 MHz' $false 60 { param($e) Set-Timing $e 19784 80 272 8 32 50 2 })
         (New-Variant '59rb' 'short blanking at 59 Hz, 163.22 MHz (under the 165 MHz limit of simple adapters and DVI)' $false 59 { param($e) Set-Timing $e 16322 80 35 8 32 3 10 })
     )
@@ -322,11 +326,22 @@ try {
                     $source = Wait-Source 20
                     $state = if ($source) { Get-HeadsetState } else { $null }
                     $r.PickedUp = [bool]($state -and ([string]$state.Name).Trim() -eq ([string]$v.Name).Trim())
+                } else {
+                    # The IGCL call failed (on a B580 with driver 32.0.101.9175 every IGCL EDID call returns
+                    # 0x40000017, also as administrator). Remove-Override above took the Windows override away, so
+                    # without putting it back the HDMI re-plug below could only ever bring back the headset's own
+                    # EDID: that is why every second variant came out "NOT TESTED".
+                    Add-Line ('    Intel driver-level EDID override (IGCL) failed: ' + (($igclOut | Select-Object -Last 1) -as [string]) + '; using the Windows override')
+                    Write-Override ([byte[]]$v.Edid)
                 }
             }
         }
         for ($try = 1; $v.Edid -and -not $r.PickedUp -and $try -le 2; $try++) {
             Request-Replug ('[' + $v.Tag + '] Windows is still using the previous display description (it shows "' + $(if ($state) { $state.Name }) + '").')
+            # Seen on a B580: right after a plug-in Windows shows the headset's own EDID, and the next monitor restart
+            # is the one that applies the override. So restart once more after the re-plug.
+            $null = Wait-Source 40
+            $null = Restart-Headset
             $source = Wait-Source 40
             $state = if ($source) { Get-HeadsetState } else { $null }
             $r.PickedUp = [bool]($state -and ([string]$state.Name).Trim() -eq ([string]$v.Name).Trim())

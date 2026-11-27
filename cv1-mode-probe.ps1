@@ -260,7 +260,7 @@ try {
         # look like the problem. hb100/hb120 look for the smallest widening the driver takes (closest to the CV1).
         (New-Variant 'hb100' 'own 272 blank lines, 100 blank columns, 299.40 MHz + HDMI VSDB 340 MHz, 90 Hz' $false 90 { param($e) Set-Timing $e 29940 100 272 8 32 50 2 } 340)
         (New-Variant 'hb120' 'own 272 blank lines, 120 blank columns, 302.05 MHz + HDMI VSDB 340 MHz, 90 Hz' $false 90 { param($e) Set-Timing $e 30205 120 272 8 32 50 2 } 340)
-        (New-Variant 'hb160''own 272 blank lines, ordinary 160 blank columns, 307.35 MHz + HDMI VSDB 340 MHz, 90 Hz' $false 90 { param($e) Set-Timing $e 30735 160 272 48 32 50 2 } 340)
+        (New-Variant 'hb160' 'own 272 blank lines, ordinary 160 blank columns, 307.35 MHz + HDMI VSDB 340 MHz, 90 Hz' $false 90 { param($e) Set-Timing $e 30735 160 272 48 32 50 2 } 340)
         (New-Variant 'vb35' 'own 80 blank columns, ordinary 35 blank lines, 248.98 MHz, 90 Hz' $false 90 { param($e) Set-Timing $e 24898 80 35 8 32 3 10 })
         (New-Variant '60hz' 'own layout at 60 Hz, 197.84 MHz' $false 60 { param($e) Set-Timing $e 19784 80 272 8 32 50 2 })
         (New-Variant '59rb' 'short blanking at 59 Hz, 163.22 MHz (under the 165 MHz limit of simple adapters and DVI)' $false 59 { param($e) Set-Timing $e 16322 80 35 8 32 3 10 })
